@@ -1,0 +1,1039 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Numerics;
+using System.Runtime.InteropServices;
+using System.Threading;
+using ScreenMaster.Core;
+using ScreenMaster.Native;
+using Vortice.D3DCompiler;
+using Vortice.Direct3D;
+using Vortice.Direct3D11;
+using Vortice.DXGI;
+
+namespace ScreenMaster.Engines
+{
+    /// <summary>
+    /// Experimental "shader mode": per monitor, captures the desktop (Desktop Duplication), runs a pixel
+    /// shader over it and presents the result in a click-through topmost window that is excluded from
+    /// capture (so it never sees itself). Used by Pesquisa de cores (3D LUT), Cor seletiva and Nitidez.
+    ///
+    /// Safety: any capture failure (UAC/secure desktop, mode change, exclusive fullscreen, HDR) hides the
+    /// window instead of leaving a frozen frame on top; a watchdog hides it if a worker stops beating.
+    /// </summary>
+    public sealed class ShaderEngine
+    {
+        /// <summary>Shader layers for one monitor, bottom to top of the stack: each one is a pass over the previous result.</summary>
+        public sealed record Params(List<Layer> Passes, ScaleSpec? Scale = null);
+
+        readonly Dictionary<Guid, double> _timings = new();
+        /// <summary>GPU time per shader layer (ms, worst monitor), measured with timestamp queries.</summary>
+        public Dictionary<Guid, double> TimingsSnapshot() { lock (_lock) return new(_timings); }
+        internal void SetTiming(Guid id, double ms) { lock (_lock) _timings[id] = _timings.TryGetValue(id, out var o) ? Math.Max(ms, o * 0.8 + ms * 0.2) : ms; }
+
+        readonly Dictionary<string, Worker> _workers = new(StringComparer.OrdinalIgnoreCase);
+        readonly object _lock = new();
+        Timer? _watchdog;
+
+        readonly Dictionary<string, string> _errors = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Per monitor: why shader mode is not showing there (copy, safe on any thread).</summary>
+        public Dictionary<string, string> ErrorsSnapshot() { lock (_lock) return new(_errors, StringComparer.OrdinalIgnoreCase); }
+        public string ErrorOf(string dev) { lock (_lock) return _errors.GetValueOrDefault(dev) ?? ""; }
+
+        public bool Active { get { lock (_lock) return _workers.Count > 0; } }
+
+        /// <summary>This monitor's shader window is up and showing frames.</summary>
+        public bool IsShowing(string dev) { lock (_lock) return _workers.TryGetValue(dev, out var w) && w.Visible; }
+
+        public void Update(List<MonitorInfo> monitors, List<Layer> layers, ScaleSpec? scale = null)
+        {
+            lock (_lock)
+            {
+                var wanted = new Dictionary<string, (MonitorInfo m, Params p)>(StringComparer.OrdinalIgnoreCase);
+                foreach (var m in monitors)
+                {
+                    var passes = layers.Where(l => l.Enabled && l.Opacity > 0 && l.AppliesTo(m.DeviceName)
+                                                   && LayerDefs.Get(l.Kind).Engine == EngineKind.Shader
+                                                   && (l.Kind != LayerKind.ColorLookup || File.Exists(l.GetS("file"))))
+                                       .Select(l => l.CloneKeepId()).ToList();
+                    var sc = scale != null && string.Equals(scale.Device, m.DeviceName, StringComparison.OrdinalIgnoreCase) ? scale : null;
+                    if (passes.Count > 0 || sc != null) wanted[m.DeviceName] = (m, new Params(passes, sc));
+                }
+                foreach (var dev in _workers.Keys.ToList())
+                    if (!wanted.TryGetValue(dev, out var w) || !_workers[dev].SameBounds(w.m))
+                    {
+                        _workers[dev].Stop();
+                        _workers.Remove(dev);
+                        _errors.Remove(dev);
+                    }
+                foreach (var (dev, w) in wanted)
+                {
+                    if (!_workers.TryGetValue(dev, out var wk))
+                    {
+                        wk = new Worker(w.m, this);
+                        _workers[dev] = wk;
+                        wk.Start();
+                    }
+                    wk.Post(w.p);
+                }
+                if (_workers.Count > 0 && _watchdog == null)
+                    _watchdog = new Timer(_ => Watch(), null, 500, 500);
+                else if (_workers.Count == 0 && _watchdog != null) { _watchdog.Dispose(); _watchdog = null; }
+                var live = wanted.Values.SelectMany(w => w.p.Passes).Select(l => l.Id).ToHashSet();
+                foreach (var id in _timings.Keys.Where(id => !live.Contains(id)).ToList()) _timings.Remove(id);
+            }
+        }
+
+        public void Clear() => Update(new List<MonitorInfo>(), new List<Layer>());
+
+        public void Stop() => Clear();
+
+        void Watch()
+        {
+            List<Worker> list;
+            lock (_lock) list = _workers.Values.ToList();
+            long now = Environment.TickCount64;
+            foreach (var w in list)
+                if (w.Visible && now - w.Heartbeat > 1500) w.HideFromOtherThread("watchdog: sem resposta");
+        }
+
+        internal void SetError(string dev, string msg)
+        {
+            lock (_lock) { if (msg.Length == 0) _errors.Remove(dev); else _errors[dev] = msg; }
+        }
+
+        /// <summary>--shadercheck: compiles the HLSL and parses a generated .cube, without touching the screen.</summary>
+        public static string Check()
+        {
+            var sb = new System.Text.StringBuilder();
+            try { var all = new[] { "VS", "PS_Cursor", "PS_Rcas" }.Concat(ScaleMath.FilterEntries).Concat(PassEntries.Values).ToList(); foreach (var e in all) Bytecode(e); sb.AppendLine("hlsl: ok (" + all.Count + " shaders)"); }
+            catch (Exception ex) { sb.AppendLine("hlsl: FAIL " + ex.Message); }
+            try
+            {
+                var tmp = Path.Combine(Path.GetTempPath(), "sm_check.cube");
+                var lines = new List<string> { "TITLE \"Teste\"", "LUT_3D_SIZE 2" };
+                for (int b = 0; b < 2; b++) for (int g = 0; g < 2; g++) for (int r = 0; r < 2; r++) lines.Add($"{r} {g} {b}");
+                File.WriteAllLines(tmp, lines);
+                var lut = LoadCube(tmp);
+                sb.AppendLine(lut.Size == 2 && lut.Title == "Teste" && lut.Rgba[4] == 1 && lut.Rgba[5] == 0 ? "cube: ok" : "cube: FAIL valores");
+                File.Delete(tmp);
+            }
+            catch (Exception ex) { sb.AppendLine("cube: FAIL " + ex.Message); }
+            foreach (var k in Enum.GetValues<LayerKind>())
+            {
+                try
+                {
+                    var d = LayerDefs.Get(k); var l = Layer.Create(k); Categories.Of(k); UI.Ui.Resource(k);
+                    HelpTexts.EngineFacts(d.Engine, false);
+                    if (!HelpTexts.Layer.ContainsKey(k)) sb.AppendLine($"kind {k}: sem texto de ajuda");
+                    foreach (var p in d.Params) l.Get(p.Key);
+                }
+                catch (Exception ex) { sb.AppendLine($"kind {k}: FAIL {ex.GetType().Name} {ex.Message}"); }
+            }
+            sb.AppendLine("kinds: checked " + Enum.GetValues<LayerKind>().Length);
+            sb.AppendLine(ScaleMath.Check());
+            try { sb.AppendLine(OffscreenTest()); }
+            catch (Exception ex) { sb.AppendLine("passes: FAIL " + ex.Message); }
+            return sb.ToString();
+        }
+
+        /// <summary>Runs every pass with neutral settings on a small offscreen image: output must equal input.</summary>
+        static unsafe string OffscreenTest()
+        {
+            const int W = 8, H = 8;
+            D3D11.D3D11CreateDevice((IDXGIAdapter?)null, DriverType.Hardware, DeviceCreationFlags.BgraSupport, new[] { FeatureLevel.Level_11_0 }, out ID3D11Device dev, out ID3D11DeviceContext ctx).CheckError();
+            using (dev) using (ctx)
+            {
+                var px = new uint[W * H];
+                for (int i = 0; i < px.Length; i++) px[i] = 0xFF000000u | (uint)((i * 37) & 0xFF) << 16 | (uint)((i * 91) & 0xFF) << 8 | (uint)((i * 13) & 0xFF);
+                Texture2DDescription D(BindFlags b, ResourceUsage u = ResourceUsage.Default, CpuAccessFlags c = CpuAccessFlags.None) => new()
+                { Width = W, Height = H, MipLevels = 1, ArraySize = 1, Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0), Usage = u, BindFlags = b, CPUAccessFlags = c };
+                ID3D11Texture2D src;
+                fixed (uint* p = px) src = dev.CreateTexture2D(D(BindFlags.ShaderResource), new[] { new SubresourceData((IntPtr)p, W * 4) });
+                using (src)
+                using (var srv = dev.CreateShaderResourceView(src))
+                using (var dst = dev.CreateTexture2D(D(BindFlags.RenderTarget)))
+                using (var rtv = dev.CreateRenderTargetView(dst))
+                using (var stage = dev.CreateTexture2D(D(BindFlags.None, ResourceUsage.Staging, CpuAccessFlags.Read)))
+                using (var vs = dev.CreateVertexShader(Bytecode("VS")))
+                using (var cb = dev.CreateBuffer(new BufferDescription((uint)Marshal.SizeOf<Constants>(), BindFlags.ConstantBuffer, ResourceUsage.Default)))
+                using (var samp = dev.CreateSamplerState(new SamplerDescription(Filter.MinMagMipPoint, TextureAddressMode.Clamp)))
+                using (var lin = dev.CreateSamplerState(new SamplerDescription(Filter.MinMagMipLinear, TextureAddressMode.Clamp)))
+                {
+                    var ident = new float[] { 0,0,0,1, 1,0,0,1, 0,1,0,1, 1,1,0,1, 0,0,1,1, 1,0,1,1, 0,1,1,1, 1,1,1,1 };
+                    ID3D11Texture3D lutTex;
+                    fixed (float* f = ident)
+                        lutTex = dev.CreateTexture3D(new Texture3DDescription { Width = 2, Height = 2, Depth = 2, MipLevels = 1, Format = Format.R32G32B32A32_Float, Usage = ResourceUsage.Immutable, BindFlags = BindFlags.ShaderResource },
+                                                     new[] { new SubresourceData((IntPtr)f, 2 * 16, 4 * 16) });
+                    using (lutTex)
+                    using (var lutView = dev.CreateShaderResourceView(lutTex))
+                    {
+                        var res = new List<string>();
+                        foreach (var (kind, entry) in PassEntries)
+                        {
+                            var l = Layer.Create(kind);
+                            if (kind == LayerKind.Sharpen) l.P["sharpen"] = 0;
+                            using var ps = dev.CreatePixelShader(Bytecode(entry));
+                            ctx.UpdateSubresource(ConstantsFor(l, W, H, 2), cb);
+                            ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                            ctx.OMSetRenderTargets(rtv);
+                            ctx.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, W, H));
+                            ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                            ctx.VSSetShader(vs); ctx.PSSetShader(ps);
+                            ctx.PSSetConstantBuffer(0, cb);
+                            ctx.PSSetSamplers(0, new[] { samp, lin });
+                            ctx.PSSetShaderResources(0, new[] { srv, lutView });
+                            ctx.Draw(3, 0);
+                            ctx.CopyResource(stage, dst);
+                            var map = ctx.Map(stage, 0, MapMode.Read);
+                            int worst = 0;
+                            for (int y = 0; y < H; y++)
+                                for (int x = 0; x < W; x++)
+                                {
+                                    uint o = ((uint*)map.DataPointer)[y * (map.RowPitch / 4) + x], e = px[y * W + x];
+                                    for (int c = 0; c < 24; c += 8) worst = Math.Max(worst, Math.Abs((int)((o >> c) & 0xFF) - (int)((e >> c) & 0xFF)));
+                                }
+                            ctx.Unmap(stage, 0);
+                            res.Add($"{kind}={(worst <= 1 ? "ok" : "FAIL diff " + worst)}");
+                        }
+                        return "passes: " + string.Join(", ", res);
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ LUT files
+
+        public sealed record CubeLut(int Size, float[] Rgba, string Title);
+        static readonly Dictionary<string, (DateTime stamp, CubeLut lut)> _cubeCache = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Reads an Adobe/Resolve .cube 3D LUT (LUT_3D_SIZE, DOMAIN_MIN/MAX, red fastest).</summary>
+        public static CubeLut LoadCube(string path)
+        {
+            var stamp = File.GetLastWriteTimeUtc(path);
+            lock (_cubeCache)
+                if (_cubeCache.TryGetValue(path, out var c) && c.stamp == stamp) return c.lut;
+            int n = 0; string title = Path.GetFileNameWithoutExtension(path);
+            var min = new float[] { 0, 0, 0 }; var max = new float[] { 1, 1, 1 };
+            var data = new List<float>();
+            foreach (var raw in File.ReadLines(path))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0 || line[0] == '#') continue;
+                var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                if (char.IsLetter(line[0]))
+                {
+                    switch (parts[0].ToUpperInvariant())
+                    {
+                        case "TITLE": title = line.Substring(5).Trim().Trim('"'); break;
+                        case "LUT_3D_SIZE": n = int.Parse(parts[1], CultureInfo.InvariantCulture); break;
+                        case "LUT_1D_SIZE": throw new InvalidDataException("LUT 1D não é suportada (só 3D).");
+                        case "DOMAIN_MIN": for (int i = 0; i < 3; i++) min[i] = float.Parse(parts[i + 1], CultureInfo.InvariantCulture); break;
+                        case "DOMAIN_MAX": for (int i = 0; i < 3; i++) max[i] = float.Parse(parts[i + 1], CultureInfo.InvariantCulture); break;
+                    }
+                    continue;
+                }
+                if (parts.Length < 3) continue;
+                for (int i = 0; i < 3; i++) data.Add(float.Parse(parts[i], CultureInfo.InvariantCulture));
+            }
+            if (n < 2 || n > 129) throw new InvalidDataException("Arquivo .cube sem LUT_3D_SIZE válido.");
+            if (data.Count != n * n * n * 3) throw new InvalidDataException($"Esperava {n * n * n} cores, achei {data.Count / 3}.");
+            var rgba = new float[n * n * n * 4];
+            for (int i = 0; i < n * n * n; i++)
+            {
+                for (int c = 0; c < 3; c++)
+                    rgba[i * 4 + c] = (data[i * 3 + c] - min[c]) / Math.Max(1e-6f, max[c] - min[c]);
+                rgba[i * 4 + 3] = 1;
+            }
+            var lut = new CubeLut(n, rgba, title);
+            lock (_cubeCache) _cubeCache[path] = (stamp, lut);
+            return lut;
+        }
+
+        // ------------------------------------------------------------------ worker (one per monitor)
+
+        /// <summary>Pixel shader entry point per shader layer kind (each layer = one pass).</summary>
+        static readonly Dictionary<LayerKind, string> PassEntries = new()
+        {
+            [LayerKind.Sharpen] = "PS_Spatial",
+            [LayerKind.ColorLookup] = "PS_Lut",
+            [LayerKind.SelectiveColor] = "PS_Selective",
+        };
+
+        static readonly Dictionary<string, byte[]> _bytecode = new();
+        /// <summary>Compiled once per process (d3dcompiler_47 ships with Windows), shared by every device.</summary>
+        static byte[] Bytecode(string entry)
+        {
+            lock (_bytecode)
+            {
+                if (_bytecode.TryGetValue(entry, out var b)) return b;
+                b = Compiler.Compile(Hlsl, entry, "shader.hlsl", entry == "VS" ? "vs_5_0" : "ps_5_0").ToArray();
+                _bytecode[entry] = b;
+                return b;
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct Constants
+        {
+            public Vector4 Texel;      // 1/w, 1/h, lutSize, mix (layer opacity)
+            public Vector4 A;          // per pass: spatial = sharpen, clarity, dehaze; selective = relative
+            public Vector4 S0, S1, S2, S3, S4, S5, S6, S7, S8; // selective: c, m, y, k per range (-1..1)
+        }
+
+        static Constants ConstantsFor(Layer l, int w, int h, int lutSize)
+        {
+            var c = new Constants { Texel = new Vector4(1f / w, 1f / h, lutSize, (float)Math.Clamp(l.Opacity / 100, 0, 1)) };
+            switch (l.Kind)
+            {
+                case LayerKind.Sharpen:
+                    c.A = new Vector4((float)(l.Get("sharpen") / 100), (float)(l.Get("clarity") / 100), (float)(l.Get("dehaze") / 100), 0);
+                    break;
+                case LayerKind.SelectiveColor:
+                    c.A = new Vector4(l.Get("relative") > 0.5 ? 1 : 0, 0, 0, 0);
+                    Vector4 R(int i) { var k = LayerDefs.SelectiveRanges[i].key; return new Vector4((float)l.Get(k + "_c"), (float)l.Get(k + "_m"), (float)l.Get(k + "_y"), (float)l.Get(k + "_k")) / 100f; }
+                    c.S0 = R(0); c.S1 = R(1); c.S2 = R(2); c.S3 = R(3); c.S4 = R(4); c.S5 = R(5); c.S6 = R(6); c.S7 = R(7); c.S8 = R(8);
+                    break;
+            }
+            return c;
+        }
+
+        sealed class Worker
+        {
+            readonly MonitorInfo _m;
+            readonly ShaderEngine _owner;
+            Thread? _thread;
+            volatile bool _stop;
+            Params? _pending;
+            readonly object _plock = new();
+            public long Heartbeat = Environment.TickCount64;
+            public volatile bool Visible;
+            IntPtr _hwnd;
+
+            public Worker(MonitorInfo m, ShaderEngine owner) { _m = m; _owner = owner; }
+
+            public bool SameBounds(MonitorInfo m) => m.Bounds.Left == _m.Bounds.Left && m.Bounds.Top == _m.Bounds.Top
+                                                     && m.Bounds.Width == _m.Bounds.Width && m.Bounds.Height == _m.Bounds.Height;
+
+            public void Start()
+            {
+                _thread = new Thread(Run) { IsBackground = true, Name = "ScreenMaster shader " + _m.DeviceName };
+                _thread.Start();
+            }
+
+            public void Post(Params p) { lock (_plock) _pending = p; }
+
+            public void Stop()
+            {
+                _stop = true;
+                HideFromOtherThread(null);
+                _thread?.Join(1500);
+            }
+
+            public void HideFromOtherThread(string? why)
+            {
+                var h = _hwnd;
+                if (h != IntPtr.Zero) ShowWindowAsync(h, 0 /* SW_HIDE */);
+                Visible = false;
+                if (why != null) { Log.Write($"shader {_m.DeviceName}: {why}"); _owner.SetError(_m.DeviceName, "Modo shader escondido: " + why); }
+            }
+
+            // ---- D3D state
+            ID3D11Device? _dev;
+            ID3D11DeviceContext? _ctx;
+            IDXGIOutputDuplication? _dup;
+            IDXGISwapChain1? _swap;
+            ID3D11Texture2D? _src;
+            ID3D11ShaderResourceView? _srcView;
+            readonly Dictionary<string, (ID3D11Texture3D tex, ID3D11ShaderResourceView view, int size)> _luts = new(StringComparer.OrdinalIgnoreCase);
+            (ID3D11Texture3D tex, ID3D11ShaderResourceView view, int size)? _identityLut;
+            ID3D11VertexShader? _vs;
+            readonly Dictionary<LayerKind, ID3D11PixelShader> _ps = new();
+            ID3D11Buffer? _cb;
+            // ping-pong targets between passes
+            readonly ID3D11Texture2D?[] _tmp = new ID3D11Texture2D?[2];
+            readonly ID3D11ShaderResourceView?[] _tmpView = new ID3D11ShaderResourceView?[2];
+            readonly ID3D11RenderTargetView?[] _tmpRtv = new ID3D11RenderTargetView?[2];
+            // GPU timing: a ring of (disjoint, timestamps per boundary) read back a few frames later
+            sealed class TimingSet { public ID3D11Query Disjoint = null!; public List<ID3D11Query> Stamps = new(); public List<Guid> Ids = new(); public bool Pending; }
+            readonly TimingSet?[] _timing = new TimingSet?[3];
+            int _timingIdx;
+            // scale mode
+            ID3D11PixelShader? _psCursor, _psRcas;
+            readonly ID3D11PixelShader?[] _psScale = new ID3D11PixelShader?[3];
+            ID3D11BlendState? _blend;
+            long _lastScaleRender;
+            IntPtr _cursorHandle;
+            ID3D11Texture2D? _cursorTex;
+            ID3D11ShaderResourceView? _cursorView;
+            int _cursorW, _cursorH, _hotX, _hotY;
+            ID3D11SamplerState? _linear, _point;
+            int _w, _h;
+
+            void Run()
+            {
+                try
+                {
+                    CreateWindow();
+                    Params? cur = null;
+                    bool haveFrame = false, dirty = false;
+                    long retryAt = 0;
+                    while (!_stop)
+                    {
+                        Heartbeat = Environment.TickCount64;
+                        Pump();
+                        Params? np;
+                        lock (_plock) { np = _pending; _pending = null; }
+                        if (np != null) { cur = np; dirty = true; }
+                        if (cur == null) { Thread.Sleep(10); continue; }
+
+                        if (_dup == null)
+                        {
+                            if (Environment.TickCount64 < retryAt) { Thread.Sleep(20); continue; }
+                            var err = InitD3D();
+                            if (err != null)
+                            {
+                                Hide(err);
+                                retryAt = Environment.TickCount64 + 1000;
+                                ReleaseD3D();
+                                continue;
+                            }
+                            haveFrame = false;
+                        }
+
+                        if (dirty) { try { UpdateLuts(cur); } catch (Exception ex) { _owner.SetError(_m.DeviceName, "LUT: " + ex.Message); } }
+
+                        var r = _dup!.AcquireNextFrame(16, out var info, out var res);
+                        if (r.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code)
+                        {
+                            // the source window can move or the cursor change shape without a new desktop frame
+                            if (cur.Scale != null && haveFrame && Environment.TickCount64 - _lastScaleRender > 100) dirty = true;
+                            if (dirty && haveFrame) { Render(cur); dirty = false; }
+                            continue;
+                        }
+                        if (r.Failure)
+                        {
+                            Hide(r.Code == Vortice.DXGI.ResultCode.AccessLost.Code ? "captura interrompida (UAC, troca de modo ou tela cheia exclusiva)" : $"captura falhou (0x{r.Code:X8})");
+                            ReleaseD3D();
+                            retryAt = Environment.TickCount64 + 500;
+                            continue;
+                        }
+                        try
+                        {
+                            if (info.ProtectedContentMaskedOut)
+                            {
+                                Hide("vídeo protegido na tela (a captura vem preta)");
+                                haveFrame = false;
+                                continue;
+                            }
+                            if (cur.Scale != null && info.LastMouseUpdateTime != 0) dirty = true;
+                            if (info.LastPresentTime != 0 || !haveFrame)
+                            {
+                                using var tex = res!.QueryInterface<ID3D11Texture2D>();
+                                if (tex.Description.Format != Format.B8G8R8A8_UNorm)
+                                {
+                                    Hide($"formato de captura não suportado ({tex.Description.Format})");
+                                    haveFrame = false;
+                                    continue;
+                                }
+                                _ctx!.CopyResource(_src!, tex);
+                                haveFrame = true;
+                                dirty = true;
+                            }
+                        }
+                        finally
+                        {
+                            res?.Dispose();
+                            _dup.ReleaseFrame();
+                        }
+                        if (dirty && haveFrame) { Render(cur); dirty = false; }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Write($"shader {_m.DeviceName} crashed: {ex}");
+                    _owner.SetError(_m.DeviceName, "Modo shader parou: " + ex.Message);
+                }
+                finally
+                {
+                    Visible = false;
+                    ReleaseD3D();
+                    if (_hwnd != IntPtr.Zero) { Win32.DestroyWindow(_hwnd); _hwnd = IntPtr.Zero; }
+                }
+            }
+
+            void Hide(string why)
+            {
+                if (Visible || _owner.ErrorOf(_m.DeviceName) != "Modo shader escondido: " + why)
+                    HideFromOtherThread(why);
+            }
+
+            static void Pump()
+            {
+                while (Win32.PeekMessage(out var msg, IntPtr.Zero, 0, 0, 1 /* PM_REMOVE */))
+                {
+                    TranslateMessage(ref msg);
+                    DispatchMessage(ref msg);
+                }
+            }
+
+            void CreateWindow()
+            {
+                EnsureClass();
+                var b = _m.Bounds;
+                _w = b.Width; _h = b.Height;
+                _hwnd = Win32.CreateWindowEx(
+                    Win32.WS_EX_LAYERED | Win32.WS_EX_TRANSPARENT | Win32.WS_EX_TOPMOST | Win32.WS_EX_TOOLWINDOW | Win32.WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+                    ClassName, "ScreenMaster shader", Win32.WS_POPUP, b.Left, b.Top, b.Width, b.Height,
+                    IntPtr.Zero, IntPtr.Zero, Win32.GetModuleHandle(null), IntPtr.Zero);
+                if (_hwnd == IntPtr.Zero) throw new InvalidOperationException($"CreateWindowEx ({Marshal.GetLastWin32Error()})");
+                SetLayeredWindowAttributes(_hwnd, 0, 255, 2 /* LWA_ALPHA */);
+                // never capture ourselves: without this the shader would feed on its own output
+                if (!Win32.SetWindowDisplayAffinity(_hwnd, Win32.WDA_EXCLUDEFROMCAPTURE))
+                    throw new InvalidOperationException("o Windows não deixou esconder a janela da captura (precisa do Windows 10 2004 ou mais novo)");
+            }
+
+            string? InitD3D()
+            {
+                try
+                {
+                    using var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
+                    IDXGIAdapter1? adapter = null; IDXGIOutput? output = null;
+                    for (uint a = 0; factory.EnumAdapters1(a, out var ad).Success; a++)
+                    {
+                        for (uint o = 0; ad.EnumOutputs(o, out var op).Success; o++)
+                        {
+                            if (string.Equals(op.Description.DeviceName, _m.DeviceName, StringComparison.OrdinalIgnoreCase)) { adapter = ad; output = op; break; }
+                            op.Dispose();
+                        }
+                        if (output != null) break;
+                        ad.Dispose();
+                    }
+                    if (adapter == null || output == null) return "monitor não encontrado na placa de vídeo";
+                    using (adapter)
+                    using (output)
+                    {
+                        using (var o6 = output.QueryInterfaceOrNull<IDXGIOutput6>())
+                            if (o6 != null && o6.Description1.ColorSpace == ColorSpaceType.RgbFullG2084NoneP2020)
+                                return "monitor em HDR (o modo shader só funciona em SDR)";
+                        if (output.Description.Rotation is not (ModeRotation.Identity or ModeRotation.Unspecified))
+                            return "monitor girado não é suportado";
+
+                        var fl = new[] { FeatureLevel.Level_11_0 };
+                        D3D11.D3D11CreateDevice(adapter, DriverType.Unknown, DeviceCreationFlags.BgraSupport, fl, out _dev, out _ctx).CheckError();
+                        using var o1 = output.QueryInterface<IDXGIOutput1>();
+                        _dup = o1.DuplicateOutput(_dev);
+                        var dd = _dup.Description.ModeDescription;
+                        _w = (int)dd.Width; _h = (int)dd.Height;
+
+                        using var f2 = adapter.GetParent<IDXGIFactory2>();
+                        var sd = new SwapChainDescription1
+                        {
+                            Width = (uint)_w, Height = (uint)_h, Format = Format.B8G8R8A8_UNorm,
+                            BufferCount = 2, BufferUsage = Vortice.DXGI.Usage.RenderTargetOutput, SampleDescription = new SampleDescription(1, 0),
+                            SwapEffect = SwapEffect.FlipDiscard, Scaling = Scaling.Stretch, AlphaMode = AlphaMode.Ignore,
+                        };
+                        _swap = f2.CreateSwapChainForHwnd(_dev, _hwnd, sd);
+                        f2.MakeWindowAssociation(_hwnd, WindowAssociationFlags.IgnoreAll);
+                    }
+
+                    _src = _dev.CreateTexture2D(new Texture2DDescription
+                    {
+                        Width = (uint)_w, Height = (uint)_h, MipLevels = 1, ArraySize = 1, Format = Format.B8G8R8A8_UNorm,
+                        SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource,
+                    });
+                    _srcView = _dev.CreateShaderResourceView(_src);
+                    for (int i = 0; i < 2; i++)
+                    {
+                        _tmp[i] = _dev.CreateTexture2D(new Texture2DDescription
+                        {
+                            Width = (uint)_w, Height = (uint)_h, MipLevels = 1, ArraySize = 1, Format = Format.B8G8R8A8_UNorm,
+                            SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget,
+                        });
+                        _tmpView[i] = _dev.CreateShaderResourceView(_tmp[i]);
+                        _tmpRtv[i] = _dev.CreateRenderTargetView(_tmp[i]);
+                    }
+                    _vs = _dev.CreateVertexShader(Bytecode("VS"));
+                    foreach (var (k, e) in PassEntries) _ps[k] = _dev.CreatePixelShader(Bytecode(e));
+                    for (int f = 0; f < _psScale.Length; f++) _psScale[f] = _dev.CreatePixelShader(Bytecode(ScaleMath.FilterEntries[f]));
+                    _psRcas = _dev.CreatePixelShader(Bytecode("PS_Rcas"));
+                    _psCursor = _dev.CreatePixelShader(Bytecode("PS_Cursor"));
+                    var bd = new BlendDescription();
+                    bd.RenderTarget[0] = new RenderTargetBlendDescription
+                    {
+                        BlendEnable = true, SourceBlend = Blend.One, DestinationBlend = Blend.InverseSourceAlpha, BlendOperation = BlendOperation.Add,
+                        SourceBlendAlpha = Blend.One, DestinationBlendAlpha = Blend.InverseSourceAlpha, BlendOperationAlpha = BlendOperation.Add,
+                        RenderTargetWriteMask = ColorWriteEnable.All,
+                    };
+                    _blend = _dev.CreateBlendState(bd);
+                    for (int i = 0; i < _timing.Length; i++)
+                        _timing[i] = new TimingSet { Disjoint = _dev.CreateQuery(new QueryDescription(QueryType.TimestampDisjoint)) };
+                    _cb = _dev.CreateBuffer(new BufferDescription((uint)Marshal.SizeOf<Constants>(), BindFlags.ConstantBuffer, ResourceUsage.Default));
+                    _linear = _dev.CreateSamplerState(new SamplerDescription(Filter.MinMagMipLinear, TextureAddressMode.Clamp));
+                    _point = _dev.CreateSamplerState(new SamplerDescription(Filter.MinMagMipPoint, TextureAddressMode.Clamp));
+                    return null;
+                }
+                catch (Exception ex)
+                {
+                    Log.Write($"shader init {_m.DeviceName}: {ex.Message}");
+                    return ex is SharpGen.Runtime.SharpGenException sg && sg.ResultCode.Code == Vortice.DXGI.ResultCode.Unsupported.Code
+                        ? "captura não suportada nesta placa/monitor"
+                        : "não foi possível iniciar a captura: " + ex.Message;
+                }
+            }
+
+            void ReleaseD3D()
+            {
+                foreach (var (t, v, _) in _luts.Values) { v.Dispose(); t.Dispose(); }
+                _luts.Clear();
+                if (_identityLut is { } id) { id.view.Dispose(); id.tex.Dispose(); _identityLut = null; }
+                for (int i = 0; i < 2; i++) { _tmpRtv[i]?.Dispose(); _tmpRtv[i] = null; _tmpView[i]?.Dispose(); _tmpView[i] = null; _tmp[i]?.Dispose(); _tmp[i] = null; }
+                foreach (var ts in _timing) { if (ts == null) continue; ts.Disjoint.Dispose(); foreach (var q in ts.Stamps) q.Dispose(); }
+                Array.Clear(_timing);
+                foreach (var ps in _ps.Values) ps.Dispose();
+                _ps.Clear();
+                for (int f = 0; f < _psScale.Length; f++) { _psScale[f]?.Dispose(); _psScale[f] = null; }
+                _psRcas?.Dispose(); _psRcas = null; _psCursor?.Dispose(); _psCursor = null; _blend?.Dispose(); _blend = null;
+                _cursorView?.Dispose(); _cursorView = null; _cursorTex?.Dispose(); _cursorTex = null; _cursorHandle = IntPtr.Zero;
+                _srcView?.Dispose(); _srcView = null; _src?.Dispose(); _src = null;
+                _cb?.Dispose(); _cb = null; _linear?.Dispose(); _linear = null; _point?.Dispose(); _point = null;
+                _swap?.Dispose(); _swap = null;
+                try { _dup?.Dispose(); } catch { }
+                _dup = null;
+                _vs?.Dispose(); _vs = null;
+                _ctx?.ClearState(); _ctx?.Dispose(); _ctx = null;
+                _dev?.Dispose(); _dev = null;
+            }
+
+            (ID3D11Texture3D tex, ID3D11ShaderResourceView view, int size) MakeLut(CubeLut lut)
+            {
+                var desc = new Texture3DDescription
+                {
+                    Width = (uint)lut.Size, Height = (uint)lut.Size, Depth = (uint)lut.Size, MipLevels = 1,
+                    Format = Format.R32G32B32A32_Float, Usage = ResourceUsage.Immutable, BindFlags = BindFlags.ShaderResource,
+                };
+                ID3D11Texture3D tex;
+                unsafe
+                {
+                    fixed (float* d = lut.Rgba)
+                    {
+                        var init = new SubresourceData((IntPtr)d, (uint)(lut.Size * 16), (uint)(lut.Size * lut.Size * 16));
+                        tex = _dev!.CreateTexture3D(desc, new[] { init });
+                    }
+                }
+                return (tex, _dev!.CreateShaderResourceView(tex), lut.Size);
+            }
+
+            /// <summary>Keeps one 3D texture per .cube used by this monitor's chain (and an identity one).</summary>
+            void UpdateLuts(Params p)
+            {
+                if (_dev == null) return;
+                _identityLut ??= MakeLut(new CubeLut(2, new float[] { 0,0,0,1, 1,0,0,1, 0,1,0,1, 1,1,0,1, 0,0,1,1, 1,0,1,1, 0,1,1,1, 1,1,1,1 }, ""));
+                var paths = p.Passes.Where(l => l.Kind == LayerKind.ColorLookup).Select(l => l.GetS("file")).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                foreach (var old in _luts.Keys.Where(k => !paths.Contains(k)).ToList()) { _luts[old].view.Dispose(); _luts[old].tex.Dispose(); _luts.Remove(old); }
+                foreach (var path in paths.Where(x => !_luts.ContainsKey(x))) _luts[path] = MakeLut(LoadCube(path));
+            }
+
+            void Render(Params p)
+            {
+                if (_dev == null || _ctx == null || _swap == null || _vs == null) return;
+                if (_identityLut == null) UpdateLuts(p);
+                var passes = p.Passes.Where(l => _ps.ContainsKey(l.Kind)).ToList();
+                ScaleMath.Rect srcRect = default, dstRect = default;
+                bool scaling = false;
+                if (p.Scale != null)
+                {
+                    if (!ScaleSource(p.Scale, out srcRect, out var why)) { Hide(why); return; }
+                    dstRect = ScaleMath.Fit((int)srcRect.W, (int)srcRect.H, _w, _h, p.Scale.Aspect, p.Scale.Integer);
+                    scaling = true;
+                    _lastScaleRender = Environment.TickCount64;
+                }
+                if (passes.Count == 0 && !scaling) return;
+
+                ReadTimings();
+                var ts = _timing[_timingIdx];
+                bool timing = ts != null && !ts.Pending;
+                if (timing)
+                {
+                    while (ts!.Stamps.Count < passes.Count + 1) ts.Stamps.Add(_dev.CreateQuery(new QueryDescription(QueryType.Timestamp)));
+                    ts.Ids = passes.Select(l => l.Id).ToList();
+                    _ctx.Begin(ts.Disjoint);
+                    _ctx.End(ts.Stamps[0]);
+                }
+
+                using var back = _swap.GetBuffer<ID3D11Texture2D>(0);
+                using var backRtv = _dev.CreateRenderTargetView(back);
+                _ctx.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, _w, _h));
+                _ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                _ctx.VSSetShader(_vs);
+                _ctx.PSSetSamplers(0, new[] { _point!, _linear! });
+                _ctx.PSSetConstantBuffer(0, _cb);
+
+                var input = _srcView!;
+                int slot = 0;
+                if (scaling)
+                {
+                    var sc = new Constants
+                    {
+                        Texel = new Vector4(1f / _w, 1f / _h, 0, 1),
+                        A = new Vector4((float)(srcRect.X / _w), (float)(srcRect.Y / _h), (float)(srcRect.W / _w), (float)(srcRect.H / _h)),
+                        S0 = new Vector4((float)dstRect.X, (float)dstRect.Y, (float)dstRect.W, (float)dstRect.H),
+                    };
+                    bool rcas = p.Scale!.Sharpen > 0;
+                    _ctx.UpdateSubresource(sc, _cb!);
+                    _ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                    _ctx.OMSetRenderTargets(passes.Count == 0 && !rcas ? backRtv : _tmpRtv[0]!);
+                    _ctx.PSSetShader(_psScale[Math.Clamp(p.Scale.Filter, 0, _psScale.Length - 1)]);
+                    _ctx.PSSetShaderResources(0, new[] { input, _identityLut!.Value.view });
+                    _ctx.Draw(3, 0);
+                    if (rcas)
+                    {
+                        // RCAS: robust contrast-adaptive sharpening on the scaled image (0..100 → 2..0 stops)
+                        sc.A = new Vector4((float)Math.Pow(2, -2 * (1 - p.Scale.Sharpen / 100)), 0, 0, 0);
+                        _ctx.UpdateSubresource(sc, _cb!);
+                        _ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                        _ctx.OMSetRenderTargets(passes.Count == 0 ? backRtv : _tmpRtv[1]!);
+                        _ctx.PSSetShader(_psRcas);
+                        _ctx.PSSetShaderResources(0, new[] { _tmpView[0]!, _identityLut!.Value.view });
+                        _ctx.Draw(3, 0);
+                    }
+                    if (passes.Count > 0) { input = _tmpView[rcas ? 1 : 0]!; slot = rcas ? 0 : 1; }
+                }
+                for (int i = 0; i < passes.Count; i++)
+                {
+                    var l = passes[i];
+                    bool last = i == passes.Count - 1;
+                    var lut = l.Kind == LayerKind.ColorLookup && _luts.TryGetValue(l.GetS("file"), out var lt) ? lt : _identityLut!.Value;
+                    _ctx.UpdateSubresource(ConstantsFor(l, _w, _h, lut.size), _cb!);
+                    _ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! }); // unbind before reusing as target
+                    _ctx.OMSetRenderTargets(last ? backRtv : _tmpRtv[(i + slot) % 2]!);
+                    _ctx.PSSetShader(_ps[l.Kind]);
+                    _ctx.PSSetShaderResources(0, new[] { input, lut.view });
+                    _ctx.Draw(3, 0);
+                    if (timing) _ctx.End(ts!.Stamps[i + 1]);
+                    if (!last) input = _tmpView[(i + slot) % 2]!;
+                }
+                if (scaling) DrawCursor(backRtv, srcRect, dstRect);
+                if (timing) { _ctx.End(ts!.Disjoint); ts.Pending = true; }
+                _timingIdx = (_timingIdx + 1) % _timing.Length;
+
+                _swap.Present(1, PresentFlags.None);
+                if (!Visible)
+                {
+                    Win32.ShowWindow(_hwnd, Win32.SW_SHOWNOACTIVATE);
+                    Visible = true;
+                    _owner.SetError(_m.DeviceName, "");
+                }
+            }
+
+            /// <summary>Client area of the scaled window, in this monitor's pixels (false = hide, with a reason).</summary>
+            bool ScaleSource(ScaleSpec s, out ScaleMath.Rect r, out string why)
+            {
+                r = default; why = "";
+                if (!IsWindow(s.Hwnd)) { why = "a janela escalada foi fechada"; return false; }
+                if (IsIconic(s.Hwnd)) { why = "a janela escalada está minimizada"; return false; }
+                if (!GetClientRect(s.Hwnd, out var cr) || cr.Width < 16 || cr.Height < 16) { why = "a janela escalada é pequena demais"; return false; }
+                var pt = new POINT();
+                ClientToScreen(s.Hwnd, ref pt);
+                double x = pt.X - _m.Bounds.Left, y = pt.Y - _m.Bounds.Top;
+                if (x < 0 || y < 0 || x + cr.Width > _w || y + cr.Height > _h) { why = "a janela escalada precisa estar inteira dentro deste monitor"; return false; }
+                r = new ScaleMath.Rect(x, y, cr.Width, cr.Height);
+                return true;
+            }
+
+            /// <summary>The real cursor is clipped to the source window (hidden); a copy is drawn on the scaled image.</summary>
+            void DrawCursor(ID3D11RenderTargetView target, ScaleMath.Rect src, ScaleMath.Rect dst)
+            {
+                var ci = new CURSORINFO { cbSize = Marshal.SizeOf<CURSORINFO>() };
+                if (!GetCursorInfo(ref ci) || (ci.flags & 1) == 0 || ci.hCursor == IntPtr.Zero) return; // hidden by the game
+                double sx = ci.pt.X - _m.Bounds.Left, sy = ci.pt.Y - _m.Bounds.Top;
+                if (sx < src.X || sy < src.Y || sx > src.X + src.W || sy > src.Y + src.H) return;
+                if (ci.hCursor != _cursorHandle) LoadCursor(ci.hCursor);
+                if (_cursorView == null) return;
+                double k = dst.W / src.W;
+                var (x, y) = ScaleMath.Map(sx, sy, src, dst);
+                float w = (float)(_cursorW * k), h = (float)(_cursorH * k);
+                _ctx!.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                _ctx.OMSetRenderTargets(target);
+                _ctx.OMSetBlendState(_blend);
+                _ctx.RSSetViewport(new Vortice.Mathematics.Viewport((float)(x - _hotX * k), (float)(y - _hotY * k), w, h));
+                _ctx.PSSetShader(_psCursor);
+                _ctx.PSSetShaderResources(0, new[] { _cursorView, _identityLut!.Value.view });
+                _ctx.Draw(3, 0);
+                _ctx.OMSetBlendState(null);
+                _ctx.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, _w, _h));
+            }
+
+            /// <summary>HCURSOR → premultiplied BGRA texture: drawn on black and on white to recover alpha (works for mono and color cursors).</summary>
+            unsafe void LoadCursor(IntPtr hc)
+            {
+                _cursorView?.Dispose(); _cursorView = null; _cursorTex?.Dispose(); _cursorTex = null;
+                _cursorHandle = hc;
+                if (!GetIconInfo(hc, out var ii)) return;
+                if (ii.hbmMask != IntPtr.Zero) Win32.DeleteObject(ii.hbmMask);
+                if (ii.hbmColor != IntPtr.Zero) Win32.DeleteObject(ii.hbmColor);
+                _hotX = ii.xHotspot; _hotY = ii.yHotspot;
+                int w = Math.Max(16, GetSystemMetrics(13 /* SM_CXCURSOR */)), h = Math.Max(16, GetSystemMetrics(14 /* SM_CYCURSOR */));
+                _cursorW = w; _cursorH = h;
+                uint[] Draw(uint bg)
+                {
+                    var screen = Win32.GetDC(IntPtr.Zero);
+                    var dc = Win32.CreateCompatibleDC(screen);
+                    Win32.ReleaseDC(IntPtr.Zero, screen);
+                    var bmi = new BITMAPINFOHEADER { biSize = Marshal.SizeOf<BITMAPINFOHEADER>(), biWidth = w, biHeight = -h, biPlanes = 1, biBitCount = 32 };
+                    var bmp = Win32.CreateDIBSection(dc, ref bmi, 0, out var bits, IntPtr.Zero, 0);
+                    var old = Win32.SelectObject(dc, bmp);
+                    var px = new Span<uint>((void*)bits, w * h);
+                    px.Fill(bg);
+                    DrawIconEx(dc, 0, 0, hc, w, h, 0, IntPtr.Zero, 3 /* DI_NORMAL */);
+                    var copy = px.ToArray();
+                    Win32.SelectObject(dc, old); Win32.DeleteObject(bmp); Win32.DeleteDC(dc);
+                    return copy;
+                }
+                var onBlack = Draw(0xFF000000); var onWhite = Draw(0xFFFFFFFF);
+                var rgba = new uint[w * h];
+                for (int i = 0; i < rgba.Length; i++)
+                {
+                    uint b = onBlack[i], wh = onWhite[i], o = 0;
+                    int a = 255;
+                    for (int c = 0; c < 24; c += 8) a = Math.Min(a, 255 - (int)(((wh >> c) & 0xFF) - ((b >> c) & 0xFF)));
+                    a = Math.Clamp(a, 0, 255);
+                    for (int c = 0; c < 24; c += 8) o |= (uint)Math.Min((int)((b >> c) & 0xFF), a) << c; // on black = color × alpha (premultiplied)
+                    rgba[i] = o | (uint)a << 24;
+                }
+                fixed (uint* d = rgba)
+                    _cursorTex = _dev!.CreateTexture2D(new Texture2DDescription
+                    {
+                        Width = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1, Format = Format.B8G8R8A8_UNorm,
+                        SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Immutable, BindFlags = BindFlags.ShaderResource,
+                    }, new[] { new SubresourceData((IntPtr)d, (uint)(w * 4)) });
+                _cursorView = _dev.CreateShaderResourceView(_cursorTex);
+            }
+
+
+            unsafe void ReadTimings()
+            {
+                foreach (var ts in _timing)
+                {
+                    if (ts == null || !ts.Pending) continue;
+                    QueryDataTimestampDisjoint dj;
+                    if (_ctx!.GetData(ts.Disjoint, (IntPtr)(&dj), (uint)sizeof(QueryDataTimestampDisjoint), AsyncGetDataFlags.DoNotFlush).Code != 0) continue;
+                    ts.Pending = false;
+                    if (dj.Disjoint || dj.Frequency == 0) continue;
+                    var t = new ulong[ts.Ids.Count + 1];
+                    bool ok = true;
+                    for (int i = 0; i < t.Length && ok; i++)
+                    {
+                        ulong v;
+                        ok = _ctx.GetData(ts.Stamps[i], (IntPtr)(&v), sizeof(ulong), AsyncGetDataFlags.DoNotFlush).Code == 0;
+                        t[i] = v;
+                    }
+                    if (!ok) continue;
+                    for (int i = 0; i < ts.Ids.Count; i++)
+                        _owner.SetTiming(ts.Ids[i], (t[i + 1] - t[i]) * 1000.0 / dj.Frequency);
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ HLSL
+
+        const string Hlsl = @"
+cbuffer C : register(b0)
+{
+    float4 Texel;   // 1/w, 1/h, lutSize, mix
+    float4 A;       // pass parameters
+    float4 SR[9];
+};
+Texture2D Src : register(t0);
+Texture3D LutTex : register(t1);
+SamplerState Pt : register(s0);
+SamplerState Lin : register(s1);
+
+struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+V VS(uint id : SV_VertexID)
+{
+    V o; o.uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+
+float Luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+float3 At(float2 uv, float2 d) { return Src.SampleLevel(Pt, uv + d * Texel.xy, 0).rgb; }
+
+float3 Spatialize(float2 uv, float3 c)
+{
+    float sharp = A.x, clarity = A.y, dehaze = A.z;
+    float3 o = c;
+    if (dehaze != 0)
+    {
+        // dark channel over a small neighbourhood estimates the haze; positive removes it, negative adds it
+        float dk = 1;
+        [unroll] for (int i = -1; i <= 1; i++) [unroll] for (int j = -1; j <= 1; j++)
+        { float3 s = At(uv, float2(i, j) * 4); dk = min(dk, min(s.r, min(s.g, s.b))); }
+        if (dehaze > 0) { float t = dk * dehaze * 0.9; o = saturate((o - t) / max(0.05, 1 - t)); }
+        else o = lerp(o, float3(0.82, 0.84, 0.86), -dehaze * 0.35);
+    }
+    if (clarity != 0)
+    {
+        float blur = 0;
+        [unroll] for (int i = 0; i < 8; i++)
+        { float a = i * 0.785398; blur += Luma(At(uv, float2(cos(a), sin(a)) * 7)); }
+        blur /= 8;
+        float l = Luma(c), w = 1 - pow(abs(2 * l - 1), 2);
+        o = saturate(o + (l - blur) * clarity * w * 1.6);
+    }
+    if (sharp > 0)
+    {
+        // contrast-adaptive sharpening (after AMD CAS): less where the area already has strong contrast
+        float3 n = At(uv, float2(0, -1)), s = At(uv, float2(0, 1)), e = At(uv, float2(1, 0)), w = At(uv, float2(-1, 0));
+        float3 mn = min(c, min(min(n, s), min(e, w))), mx = max(c, max(max(n, s), max(e, w)));
+        float3 amp = sqrt(saturate(min(mn, 1 - mx) / max(mx, 1e-4)));
+        float3 wt = -amp * lerp(0.125, 0.2, sharp);
+        float3 sh = saturate((c + (n + s + e + w) * wt) / (1 + 4 * wt));
+        o = saturate(o + (sh - c));
+    }
+    return o;
+}
+
+float3 ApplyLut(float3 c)
+{
+    float n = Texel.z;
+    float3 uvw = c * ((n - 1) / n) + 0.5 / n;
+    return LutTex.SampleLevel(Lin, uvw, 0).rgb;
+}
+
+float3 Selective(float3 c)
+{
+    float mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b));
+    float md = c.r + c.g + c.b - mx - mn;
+    float w[9];
+    w[0] = (c.r == mx) ? mx - md : 0;           // reds
+    w[1] = (c.b == mn) ? md - mn : 0;           // yellows
+    w[2] = (c.g == mx) ? mx - md : 0;           // greens
+    w[3] = (c.r == mn) ? md - mn : 0;           // cyans
+    w[4] = (c.b == mx) ? mx - md : 0;           // blues
+    w[5] = (c.g == mn) ? md - mn : 0;           // magentas
+    w[6] = saturate((mn - 0.5) * 2);            // whites
+    w[7] = saturate(1 - (abs(mx - 0.5) + abs(mn - 0.5))); // neutrals
+    w[8] = saturate((0.5 - mx) * 2);            // blacks
+    float3 ink = 1 - c, d = 0;
+    [unroll] for (int i = 0; i < 9; i++)
+    {
+        float4 a = SR[i];
+        float3 adj = float3(a.x, a.y, a.z) + a.w;           // cyan/magenta/yellow ink + black on all three
+        float3 delta = A.x > 0.5 ? adj * ink : adj;        // relative scales with the ink already there
+        d += clamp(delta, -ink, c) * w[i];
+    }
+    return saturate(c - d);
+}
+
+float3 In(V i) { return Src.SampleLevel(Pt, i.uv, 0).rgb; }
+
+// scale mode: A = source rect in source uv (x, y, w, h), SR[0] = destination rect in output pixels
+float4 PS_Scale(V i) : SV_Target
+{
+    float2 p = (i.pos.xy - SR[0].xy) / SR[0].zw;
+    if (any(p < 0) || any(p > 1)) return float4(0, 0, 0, 1);
+    return float4(Src.SampleLevel(Lin, A.xy + p * A.zw, 0).rgb, 1);
+}
+float2 ScaleSrc(V i, out bool inside)
+{
+    float2 p = (i.pos.xy - SR[0].xy) / SR[0].zw;
+    inside = all(p >= 0) && all(p <= 1);
+    return (A.xy + p * A.zw) / Texel.xy;   // source position in pixels of the captured monitor
+}
+float3 Px(float2 pix) { return Src.SampleLevel(Pt, (floor(pix) + 0.5) * Texel.xy, 0).rgb; }
+
+// Catmull-Rom bicubic, 16 taps
+float CR(float x) { x = abs(x); return x < 1 ? 1.5*x*x*x - 2.5*x*x + 1 : (x < 2 ? -0.5*x*x*x + 2.5*x*x - 4*x + 2 : 0); }
+float4 PS_ScaleBicubic(V i) : SV_Target
+{
+    bool inside; float2 s = ScaleSrc(i, inside) - 0.5;
+    if (!inside) return float4(0, 0, 0, 1);
+    float2 f = frac(s), b = floor(s);
+    float3 acc = 0; float wsum = 0;
+    [unroll] for (int y = -1; y <= 2; y++) [unroll] for (int x = -1; x <= 2; x++)
+    { float w = CR(x - f.x) * CR(y - f.y); acc += Px(b + float2(x, y) + 0.5) * w; wsum += w; }
+    return float4(saturate(acc / wsum), 1);
+}
+
+// Lanczos 3, 36 taps, clamped to the 2x2 neighbourhood to avoid ringing halos
+float L3(float x) { x = abs(x); if (x < 1e-4) return 1; if (x >= 3) return 0; float px = 3.14159265 * x; return 3 * sin(px) * sin(px / 3) / (px * px); }
+float4 PS_ScaleLanczos(V i) : SV_Target
+{
+    bool inside; float2 s = ScaleSrc(i, inside) - 0.5;
+    if (!inside) return float4(0, 0, 0, 1);
+    float2 f = frac(s), b = floor(s);
+    float3 acc = 0, mn = 1, mx = 0; float wsum = 0;
+    [unroll] for (int y = -2; y <= 3; y++) [unroll] for (int x = -2; x <= 3; x++)
+    {
+        float3 c = Px(b + float2(x, y) + 0.5);
+        float w = L3(x - f.x) * L3(y - f.y);
+        acc += c * w; wsum += w;
+        if (x >= 0 && x <= 1 && y >= 0 && y <= 1) { mn = min(mn, c); mx = max(mx, c); }
+    }
+    return float4(clamp(acc / wsum, mn, mx), 1);
+}
+
+// RCAS-style sharpening (after AMD FidelityFX FSR 1 RCAS, MIT): A.x = sharpness 0..1
+float4 PS_Rcas(V i) : SV_Target
+{
+    float3 e = In(i);
+    float3 b = At(i.uv, float2(0, -1)), d = At(i.uv, float2(-1, 0)), f = At(i.uv, float2(1, 0)), h = At(i.uv, float2(0, 1));
+    float3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));
+    float3 hitMin = mn4 / (4 * mx4 + 1e-5);
+    float3 hitMax = (1 - mx4) / (4 * mn4 - 4 - 1e-5);
+    float3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0)) * A.x;
+    return float4(saturate((lobe * (b + d + f + h) + e) / (4 * lobe + 1)), 1);
+}
+
+// cursor quad: drawn with its own viewport, premultiplied alpha
+float4 PS_Cursor(V i) : SV_Target { return Src.SampleLevel(Lin, i.uv, 0); }
+float4 PS_Spatial(V i) : SV_Target { float3 c = In(i); return float4(lerp(c, Spatialize(i.uv, c), Texel.w), 1); }
+float4 PS_Lut(V i) : SV_Target { float3 c = In(i); return float4(lerp(c, ApplyLut(c), Texel.w), 1); }
+float4 PS_Selective(V i) : SV_Target { float3 c = In(i); return float4(lerp(c, Selective(c), Texel.w), 1); }";
+
+        // ------------------------------------------------------------------ win32 bits
+
+        const string ClassName = "ScreenMasterShader";
+        const int WS_EX_NOREDIRECTIONBITMAP = 0x00200000;
+        static readonly WndProc _wndProc = (h, m, w, l) => Win32.DefWindowProc(h, m, w, l);
+        static bool _classDone;
+        static void EnsureClass()
+        {
+            lock (_wndProc)
+            {
+                if (_classDone) return;
+                var wc = new WNDCLASSEX
+                {
+                    cbSize = Marshal.SizeOf<WNDCLASSEX>(),
+                    lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProc),
+                    hInstance = Win32.GetModuleHandle(null),
+                    lpszClassName = ClassName,
+                };
+                Win32.RegisterClassEx(ref wc);
+                _classDone = true;
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)] struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public POINT pt; }
+        [StructLayout(LayoutKind.Sequential)] struct ICONINFO { public bool fIcon; public int xHotspot, yHotspot; public IntPtr hbmMask, hbmColor; }
+        [DllImport("user32.dll")] static extern bool GetCursorInfo(ref CURSORINFO ci);
+        [DllImport("user32.dll")] static extern bool GetIconInfo(IntPtr icon, out ICONINFO info);
+        [DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
+        [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+        [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+        [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint key, byte alpha, uint flags);
+        [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr hwnd, int cmd);
+        [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG msg);
+        [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG msg);
+    }
+}
