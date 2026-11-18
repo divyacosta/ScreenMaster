@@ -110,7 +110,7 @@ namespace ScreenMaster.Engines
         public static string Check()
         {
             var sb = new System.Text.StringBuilder();
-            try { var all = new[] { "VS", "PS_Cursor", "PS_FsrRcas" }.Concat(ScaleMath.FilterEntries).Concat(PassEntries.Values).ToList(); foreach (var e in all) Bytecode(e); sb.AppendLine("hlsl: ok (" + all.Count + " shaders)"); }
+            try { NisCoefficients(); var all = new[] { "VS", "PS_Cursor", "PS_FsrRcas", "CS_Nis", "PS_Crop" }.Concat(ShaderGraphs.All.SelectMany(g => g.Passes.Select(p => p.Entry))).Concat(ScaleMath.FilterEntries).Concat(PassEntries.Values).ToList(); foreach (var e in all) Bytecode(e); sb.AppendLine("hlsl: ok (" + all.Count + " shaders)"); }
             catch (Exception ex) { sb.AppendLine("hlsl: FAIL " + ex.Message); }
             try
             {
@@ -229,7 +229,108 @@ namespace ScreenMaster.Engines
                             double avg = sum / n;
                             sres.Add($"{ScaleMath.FilterEntries[f]}={(avg <= 6 ? "ok" : "FAIL")}({avg:0.0})");
                         }
-                        return "passes: " + string.Join(", ", res) + Environment.NewLine + "scale filters 1:1: " + string.Join(", ", sres);
+                        // NVIDIA NIS at 1:1 with no sharpening must also reproduce the image
+                        string nisStep = "coef";
+                        try
+                        {
+                            var (cs, cu) = NisCoefficients();
+                            ID3D11Texture2D Coef(float[] v) { fixed (float* d = v) return dev.CreateTexture2D(new Texture2DDescription { Width = 2, Height = 64, MipLevels = 1, ArraySize = 1, Format = Format.R32G32B32A32_Float, SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Immutable, BindFlags = BindFlags.ShaderResource }, new[] { new SubresourceData((IntPtr)d, 32) }); }
+                            using var ts = Coef(cs); using var tu = Coef(cu); nisStep = "views";
+                            using var vs2 = dev.CreateShaderResourceView(ts); using var vu = dev.CreateShaderResourceView(tu);
+                            nisStep = "out"; using var outT = dev.CreateTexture2D(new Texture2DDescription { Width = W, Height = H, MipLevels = 1, ArraySize = 1, Format = Format.R16G16B16A16_Float, SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Default, BindFlags = BindFlags.UnorderedAccess });
+                            nisStep = "uav"; using var uav = dev.CreateUnorderedAccessView(outT); nisStep = "staging";
+                            using var st16 = dev.CreateTexture2D(new Texture2DDescription { Width = W, Height = H, MipLevels = 1, ArraySize = 1, Format = Format.R16G16B16A16_Float, SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Staging, CPUAccessFlags = CpuAccessFlags.Read });
+                            nisStep = "cs"; using var csh = dev.CreateComputeShader(Bytecode("CS_Nis")); nisStep = "cb";
+                            using var cbn = dev.CreateBuffer(new BufferDescription((uint)Marshal.SizeOf<NisConstants>(), BindFlags.ConstantBuffer, ResourceUsage.Default));
+                            nisStep = "run"; ctx.UpdateSubresource(NisConfig(0, 0, 0, W, H, W, H, W, H), cbn);
+                            ctx.OMSetRenderTargets(new ID3D11RenderTargetView[] { null! });
+                            ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                            ctx.CSSetShader(csh); ctx.CSSetConstantBuffer(0, cbn); ctx.CSSetSampler(0, lin);
+                            ctx.CSSetShaderResources(0, new[] { srv, vs2, vu });
+                            ctx.CSSetUnorderedAccessView(0, uav);
+                            ctx.Dispatch(1, 1, 1);
+                            ctx.CSSetUnorderedAccessView(0, null!);
+                            ctx.CopyResource(st16, outT);
+                            var map = ctx.Map(st16, 0, MapMode.Read);
+                            double sum = 0; int n = 0;
+                            for (int y = 1; y < H - 1; y++)
+                                for (int x = 1; x < W - 1; x++)
+                                {
+                                    var hp = (Half*)((byte*)map.DataPointer + y * map.RowPitch) + x * 4;
+                                    uint e = px[y * W + x];
+                                    float[] exp = { ((e >> 16) & 0xFF) / 255f, ((e >> 8) & 0xFF) / 255f, (e & 0xFF) / 255f };
+                                    for (int c = 0; c < 3; c++) { sum += Math.Abs((float)hp[c] - exp[c]) * 255; n++; }
+                                }
+                            ctx.Unmap(st16, 0);
+                            double avg = sum / n;
+                            sres.Add($"CS_Nis={(avg <= 6 ? "ok" : "FAIL")}({avg:0.0})");
+                        }
+                        catch (Exception ex) { sres.Add($"CS_Nis=FAIL em {nisStep}: {ex.Message.Split((char)10)[0]}"); }
+                        // multi-pass upscalers on a smooth image: OUT (2×) must stay close to the source
+                        var gres = new List<string>();
+                        foreach (var g in ShaderGraphs.All)
+                        {
+                            try
+                            {
+                                var texs = new Dictionary<string, (ID3D11Texture2D t, ID3D11ShaderResourceView v, ID3D11RenderTargetView r, int w, int h)>();
+                                void Make(string name, int w, int h)
+                                {
+                                    var t = dev.CreateTexture2D(new Texture2DDescription { Width = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1, Format = Format.R16G16B16A16_Float, SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget });
+                                    texs[name] = (t, dev.CreateShaderResourceView(t), dev.CreateRenderTargetView(t), w, h);
+                                }
+                                Make("SOURCE", W, H);
+                                foreach (var gp in g.Passes) if (!texs.ContainsKey(gp.Output)) Make(gp.Output, (int)(W * gp.Scale), (int)(H * gp.Scale));
+                                // SOURCE = the test image (copy through PS_Scale at 1:1)
+                                using (var cp = dev.CreatePixelShader(Bytecode("PS_Scale")))
+                                {
+                                    ctx.UpdateSubresource(new Constants { Texel = new Vector4(1f / W, 1f / H, 0, 1), A = new Vector4(0, 0, 1, 1), S0 = new Vector4(0, 0, W, H) }, cb);
+                                    ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                                    ctx.OMSetRenderTargets(texs["SOURCE"].r);
+                                    ctx.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, W, H));
+                                    ctx.PSSetShader(cp);
+                                    ctx.PSSetShaderResources(0, new[] { srv, lutView });
+                                    ctx.Draw(3, 0);
+                                }
+                                using var gcb = dev.CreateBuffer(new BufferDescription((uint)Marshal.SizeOf<GraphConstants>(), BindFlags.ConstantBuffer, ResourceUsage.Default));
+                                Vector4 Sz(int w, int h) => new(w, h, 1f / w, 1f / h);
+                                foreach (var gp in g.Passes)
+                                {
+                                    using var ps = dev.CreatePixelShader(Bytecode(gp.Entry));
+                                    var o = texs[gp.Output]; var ins = gp.Inputs.Select(n => texs[n]).ToArray();
+                                    ctx.UpdateSubresource(new GraphConstants { OutSize = Sz(o.w, o.h), In0Size = Sz(ins[0].w, ins[0].h), SrcSize = Sz(W, H) }, gcb);
+                                    ctx.PSSetConstantBuffer(0, gcb);
+                                    ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null!, null!, null! });
+                                    ctx.OMSetRenderTargets(o.r);
+                                    ctx.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, o.w, o.h));
+                                    ctx.PSSetShader(ps);
+                                    ctx.PSSetShaderResources(0, ins.Select(x => x.v).ToArray());
+                                    ctx.Draw(3, 0);
+                                }
+                                ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null!, null!, null! });
+                                ctx.PSSetConstantBuffer(0, cb);
+                                var outT = texs["OUT"];
+                                using var st = dev.CreateTexture2D(new Texture2DDescription { Width = (uint)outT.w, Height = (uint)outT.h, MipLevels = 1, ArraySize = 1, Format = Format.R16G16B16A16_Float, SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Staging, CPUAccessFlags = CpuAccessFlags.Read });
+                                ctx.CopyResource(st, outT.t);
+                                var map = ctx.Map(st, 0, MapMode.Read);
+                                double sum = 0; int n = 0; bool nan = false;
+                                for (int y = 2; y < outT.h - 2; y++)
+                                    for (int x = 2; x < outT.w - 2; x++)
+                                    {
+                                        var hp = (Half*)((byte*)map.DataPointer + y * map.RowPitch) + x * 4;
+                                        // expected: the smooth gradient sampled at the same place
+                                        double sx = (x + 0.5) / 2 - 0.5, sy = (y + 0.5) / 2 - 0.5;
+                                        double[] e = { sx * 255 / (W - 1), sy * 255 / (H - 1), (sx + sy) * 255 / (W + H - 2) };
+                                        for (int c = 0; c < 3; c++) { float v = (float)hp[c]; if (float.IsNaN(v)) nan = true; sum += Math.Abs(v * 255 - Math.Clamp(e[c], 0, 255)); n++; }
+                                    }
+                                ctx.Unmap(st, 0);
+                                foreach (var t in texs.Values) { t.r.Dispose(); t.v.Dispose(); t.t.Dispose(); }
+                                double avg = sum / n;
+                                gres.Add($"{g.Name}={(nan ? "FAIL NaN" : avg <= 12 ? "ok" : "FAIL")}({avg:0.0})");
+                            }
+                            catch (Exception ex) { gres.Add($"{g.Name}=FAIL {ex.Message.Split((char)10)[0]}"); }
+                        }
+                        return "passes: " + string.Join(", ", res) + Environment.NewLine + "scale filters 1:1: " + string.Join(", ", sres)
+                               + Environment.NewLine + "upscalers 2x: " + string.Join(", ", gres);
                     }
                 }
             }
@@ -352,8 +453,88 @@ float4 PS_Sgsr(V i) : SV_Target
     SgsrYuvH(o, A.xy + p * A.zw, float4(Texel.xy, 1 / Texel.xy));
     return float4(saturate(o.rgb), 1);
 }",
+            "CS_Nis" => @"
+#define NIS_HLSL 1
+#define NIS_SCALER 1
+#define NIS_HDR_MODE 0
+#define NIS_VIEWPORT_SUPPORT 1
+#define NIS_BLOCK_WIDTH 32
+#define NIS_BLOCK_HEIGHT 24
+#define NIS_THREAD_GROUP_SIZE 256
+// constant layout from NVIDIA's NIS_Main.hlsl (MIT)
+cbuffer cb : register(b0)
+{
+    float kDetectRatio; float kDetectThres; float kMinContrastRatio; float kRatioNorm;
+    float kContrastBoost; float kEps; float kSharpStartY; float kSharpScaleY;
+    float kSharpStrengthMin; float kSharpStrengthScale; float kSharpLimitMin; float kSharpLimitScale;
+    float kScaleX; float kScaleY; float kDstNormX; float kDstNormY;
+    float kSrcNormX; float kSrcNormY;
+    uint kInputViewportOriginX; uint kInputViewportOriginY; uint kInputViewportWidth; uint kInputViewportHeight;
+    uint kOutputViewportOriginX; uint kOutputViewportOriginY; uint kOutputViewportWidth; uint kOutputViewportHeight;
+    float reserved0; float reserved1;
+};
+SamplerState samplerLinearClamp : register(s0);
+Texture2D in_texture : register(t0);
+RWTexture2D<float4> out_texture : register(u0);
+Texture2D coef_scaler : register(t1);
+Texture2D coef_usm : register(t2);
+" + Vendor("nis/NIS_Scaler.h") + @"
+[numthreads(NIS_THREAD_GROUP_SIZE, 1, 1)]
+void CS_Nis(uint3 blockIdx : SV_GroupID, uint3 threadIdx : SV_GroupThreadID) { NVScaler(blockIdx.xy, threadIdx.x); }",
+            _ when GraphOf(entry) is { } g => Vendor(g.Resource),
             _ => Hlsl,
         };
+
+        static ShaderGraph? GraphOf(string entry) => ShaderGraphs.All.FirstOrDefault(g => g.Passes.Any(p => p.Entry == entry));
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct GraphConstants { public Vector4 OutSize, In0Size, SrcSize, Pad; }
+
+        static float[]? _nisScale, _nisUsm;
+        /// <summary>NIS filter tables (64 phases × 8 taps), read from NVIDIA's NIS_Config.h as shipped.</summary>
+        static (float[] scale, float[] usm) NisCoefficients()
+        {
+            if (_nisScale != null && _nisUsm != null) return (_nisScale, _nisUsm);
+            var src = Vendor("nis/NIS_Config.h");
+            float[] Table(string name)
+            {
+                int i = src.IndexOf(name + "[kPhaseCount][kFilterSize] = {", StringComparison.Ordinal);
+                int j = src.IndexOf("};", i, StringComparison.Ordinal);
+                var nums = System.Text.RegularExpressions.Regex.Matches(src.Substring(i + name.Length + 30, j - i - name.Length - 30), @"-?\d+\.\d+(?:e-?\d+)?f?");
+                var v = nums.Select(m => float.Parse(m.Value.TrimEnd('f'), CultureInfo.InvariantCulture)).ToArray();
+                if (v.Length != 64 * 8) throw new InvalidDataException($"NIS: {name} com {v.Length} valores");
+                return v;
+            }
+            _nisScale = Table("coef_scale"); _nisUsm = Table("coef_usm");
+            return (_nisScale, _nisUsm);
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct NisConstants
+        {
+            public float DetectRatio, DetectThres, MinContrastRatio, RatioNorm, ContrastBoost, Eps, SharpStartY, SharpScaleY,
+                         SharpStrengthMin, SharpStrengthScale, SharpLimitMin, SharpLimitScale, ScaleX, ScaleY, DstNormX, DstNormY, SrcNormX, SrcNormY;
+            public uint InX, InY, InW, InH, OutX, OutY, OutW, OutH;
+            public float R0, R1, Pad0, Pad1, Pad2, Pad3; // 128 bytes (constant buffers are multiples of 16)
+        }
+
+        /// <summary>Port of NVScalerUpdateConfig (NIS_Config.h, SDR) — sharpness 0..1.</summary>
+        static NisConstants NisConfig(float sharpness, uint inX, uint inY, uint inW, uint inH, uint texW, uint texH, uint outW, uint outH)
+        {
+            sharpness = Math.Clamp(sharpness, 0, 1);
+            float s = sharpness - 0.5f;
+            float maxScale = s >= 0 ? 1.25f : 1.75f, minScale = s >= 0 ? 1.25f : 1.0f, limitScale = s >= 0 ? 1.25f : 1.0f;
+            float strengthMin = Math.Max(0, 0.4f + s * minScale * 1.2f), strengthMax = 1.6f + s * maxScale * 1.8f;
+            float limitMin = Math.Max(0.1f, 0.14f + s * limitScale * 0.32f), limitMax = 0.5f + s * limitScale * 0.6f;
+            return new NisConstants
+            {
+                DetectRatio = 2 * 1127f / 1024f, DetectThres = 64f / 1024f, MinContrastRatio = 2f, RatioNorm = 1f / (10f - 2f),
+                ContrastBoost = 1f, Eps = 1f / 255f, SharpStartY = 0.45f, SharpScaleY = 1f / (0.9f - 0.45f),
+                SharpStrengthMin = strengthMin, SharpStrengthScale = strengthMax - strengthMin, SharpLimitMin = limitMin, SharpLimitScale = limitMax - limitMin,
+                ScaleX = inW / (float)outW, ScaleY = inH / (float)outH, DstNormX = 1f / outW, DstNormY = 1f / outH, SrcNormX = 1f / texW, SrcNormY = 1f / texH,
+                InX = inX, InY = inY, InW = inW, InH = inH, OutX = 0, OutY = 0, OutW = outW, OutH = outH,
+            };
+        }
 
         static readonly Dictionary<string, byte[]> _bytecode = new();
         /// <summary>Compiled once per process (d3dcompiler_47 ships with Windows), shared by every device.</summary>
@@ -362,7 +543,7 @@ float4 PS_Sgsr(V i) : SV_Target
             lock (_bytecode)
             {
                 if (_bytecode.TryGetValue(entry, out var b)) return b;
-                b = Compiler.Compile(SourceFor(entry), entry, entry + ".hlsl", entry == "VS" ? "vs_5_0" : "ps_5_0").ToArray();
+                b = Compiler.Compile(SourceFor(entry), entry, entry + ".hlsl", entry == "VS" ? "vs_5_0" : entry.StartsWith("CS_") ? "cs_5_0" : "ps_5_0").ToArray();
                 _bytecode[entry] = b;
                 return b;
             }
@@ -455,6 +636,19 @@ float4 PS_Sgsr(V i) : SV_Target
             int _timingIdx;
             // scale mode
             ID3D11PixelShader? _psCursor, _psRcas;
+            // NVIDIA NIS (compute): coefficient tables, constants and an output sized to the scaled image (≤ 2× the source)
+            ID3D11ComputeShader? _csNis;
+            ID3D11Buffer? _cbNis;
+            ID3D11Texture2D? _nisCoefS, _nisCoefU, _nisOut;
+            ID3D11ShaderResourceView? _nisCoefSView, _nisCoefUView, _nisOutView;
+            ID3D11UnorderedAccessView? _nisOutUav;
+            int _nisW, _nisH;
+            // multi-pass upscalers: named RGBA16F targets ("SOURCE" = cropped window), per-graph shaders
+            ID3D11PixelShader? _psCrop;
+            ID3D11Buffer? _cbGraph;
+            readonly Dictionary<string, ID3D11PixelShader> _psGraph = new();
+            readonly Dictionary<string, (ID3D11Texture2D tex, ID3D11ShaderResourceView srv, ID3D11RenderTargetView rtv, int w, int h)> _graphTex = new();
+            string _graphKey = "";
             readonly ID3D11PixelShader?[] _psScale = new ID3D11PixelShader?[ScaleMath.FilterEntries.Length];
             ID3D11BlendState? _blend;
             long _lastScaleRender;
@@ -652,6 +846,13 @@ float4 PS_Sgsr(V i) : SV_Target
                     foreach (var (k, e) in PassEntries) _ps[k] = _dev.CreatePixelShader(Bytecode(e));
                     for (int f = 0; f < _psScale.Length; f++) _psScale[f] = _dev.CreatePixelShader(Bytecode(ScaleMath.FilterEntries[f]));
                     _psRcas = _dev.CreatePixelShader(Bytecode("PS_FsrRcas"));
+                    _csNis = _dev.CreateComputeShader(Bytecode("CS_Nis"));
+                    _psCrop = _dev.CreatePixelShader(Bytecode("PS_Crop"));
+                    _cbGraph = _dev.CreateBuffer(new BufferDescription((uint)Marshal.SizeOf<GraphConstants>(), BindFlags.ConstantBuffer, ResourceUsage.Default));
+                    _cbNis = _dev.CreateBuffer(new BufferDescription((uint)Marshal.SizeOf<NisConstants>(), BindFlags.ConstantBuffer, ResourceUsage.Default));
+                    var (cs, cu) = NisCoefficients();
+                    (_nisCoefS, _nisCoefSView) = CoefTexture(cs);
+                    (_nisCoefU, _nisCoefUView) = CoefTexture(cu);
                     _psCursor = _dev.CreatePixelShader(Bytecode("PS_Cursor"));
                     var bd = new BlendDescription();
                     bd.RenderTarget[0] = new RenderTargetBlendDescription
@@ -688,6 +889,14 @@ float4 PS_Sgsr(V i) : SV_Target
                 foreach (var ps in _ps.Values) ps.Dispose();
                 _ps.Clear();
                 for (int f = 0; f < _psScale.Length; f++) { _psScale[f]?.Dispose(); _psScale[f] = null; }
+                _csNis?.Dispose(); _csNis = null; _cbNis?.Dispose(); _cbNis = null;
+                _psCrop?.Dispose(); _psCrop = null; _cbGraph?.Dispose(); _cbGraph = null;
+                foreach (var ps in _psGraph.Values) ps.Dispose();
+                _psGraph.Clear();
+                ReleaseGraphTextures();
+                _nisCoefSView?.Dispose(); _nisCoefSView = null; _nisCoefS?.Dispose(); _nisCoefS = null;
+                _nisCoefUView?.Dispose(); _nisCoefUView = null; _nisCoefU?.Dispose(); _nisCoefU = null;
+                ReleaseNisOut();
                 _psRcas?.Dispose(); _psRcas = null; _psCursor?.Dispose(); _psCursor = null; _blend?.Dispose(); _blend = null;
                 _cursorView?.Dispose(); _cursorView = null; _cursorTex?.Dispose(); _cursorTex = null; _cursorHandle = IntPtr.Zero;
                 _srcView?.Dispose(); _srcView = null; _src?.Dispose(); _src = null;
@@ -783,10 +992,18 @@ float4 PS_Sgsr(V i) : SV_Target
                     bool rcas = p.Scale!.Sharpen > 0;
                     _ctx.UpdateSubresource(sc, _cb!);
                     _ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                    bool nis = p.Scale.Filter == ScaleMath.NisFilter;
+                    int gi = p.Scale.Filter - ScaleMath.GraphFilter0;
+                    bool graph = gi >= 0 && gi < ShaderGraphs.All.Length;
+                    if (nis) { rcas = false; NisScale(srcRect, dstRect, (float)(p.Scale.Sharpen / 100), ref sc); input = _nisOutView!; }
+                    else if (graph) { input = RunGraph(ShaderGraphs.All[gi], srcRect, ref sc); }
+                    _ctx.UpdateSubresource(sc, _cb!);
                     _ctx.OMSetRenderTargets(passes.Count == 0 && !rcas ? backRtv : _tmpRtv[0]!);
-                    _ctx.PSSetShader(_psScale[Math.Clamp(p.Scale.Filter, 0, _psScale.Length - 1)]);
+                    // NIS output is placed (and resized if the screen is > 2× the source) with Lanczos
+                    _ctx.PSSetShader(nis || graph ? _psScale[2] : _psScale[Math.Clamp(p.Scale.Filter, 0, _psScale.Length - 1)]);
                     _ctx.PSSetShaderResources(0, new[] { input, _identityLut!.Value.view });
                     _ctx.Draw(3, 0);
+                    input = _srcView!;
                     if (rcas)
                     {
                         // AMD FSR 1 RCAS on the scaled image: 0..100 % → 2..0 stops (FsrRcasCon: con.x = exp2(-stops))
@@ -825,6 +1042,136 @@ float4 PS_Sgsr(V i) : SV_Target
                     Visible = true;
                     _owner.SetError(_m.DeviceName, "");
                 }
+            }
+
+            (ID3D11Texture2D, ID3D11ShaderResourceView) CoefTexture(float[] v)
+            {
+                unsafe
+                {
+                    fixed (float* d = v)
+                    {
+                        var t = _dev!.CreateTexture2D(new Texture2DDescription
+                        {
+                            Width = 2, Height = 64, MipLevels = 1, ArraySize = 1, Format = Format.R32G32B32A32_Float,
+                            SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Immutable, BindFlags = BindFlags.ShaderResource,
+                        }, new[] { new SubresourceData((IntPtr)d, 2 * 16) });
+                        return (t, _dev.CreateShaderResourceView(t));
+                    }
+                }
+            }
+
+            void ReleaseGraphTextures()
+            {
+                foreach (var t in _graphTex.Values) { t.rtv.Dispose(); t.srv.Dispose(); t.tex.Dispose(); }
+                _graphTex.Clear();
+                _graphKey = "";
+            }
+
+            /// <summary>
+            /// Crops the window out of the capture at native size ("SOURCE"), runs the graph's passes on named
+            /// RGBA16F targets and returns "OUT" (2×). sc is rewritten so the next draw places OUT on the destination rect.
+            /// </summary>
+            ID3D11ShaderResourceView RunGraph(ShaderGraph g, ScaleMath.Rect src, ref Constants sc)
+            {
+                int sw = (int)src.W, sh = (int)src.H;
+                var key = $"{g.Name}|{sw}x{sh}";
+                if (key != _graphKey)
+                {
+                    ReleaseGraphTextures();
+                    void Make(string name, int w, int h)
+                    {
+                        var t = _dev!.CreateTexture2D(new Texture2DDescription
+                        {
+                            Width = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1, Format = Format.R16G16B16A16_Float,
+                            SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget,
+                        });
+                        _graphTex[name] = (t, _dev.CreateShaderResourceView(t), _dev.CreateRenderTargetView(t), w, h);
+                    }
+                    Make("SOURCE", sw, sh);
+                    foreach (var ps in g.Passes)
+                        if (!_graphTex.ContainsKey(ps.Output)) Make(ps.Output, (int)Math.Round(sw * ps.Scale), (int)Math.Round(sh * ps.Scale));
+                    foreach (var ps in g.Passes)
+                        if (!_psGraph.ContainsKey(ps.Entry)) _psGraph[ps.Entry] = _dev!.CreatePixelShader(Bytecode(ps.Entry));
+                    _graphKey = key;
+                }
+                var none = new ID3D11ShaderResourceView[] { null!, null!, null!, null! };
+                // crop
+                var s0 = _graphTex["SOURCE"];
+                sc.Texel = new Vector4(1f / _w, 1f / _h, 0, 1);
+                sc.A = new Vector4((float)(src.X / _w), (float)(src.Y / _h), (float)(src.W / _w), (float)(src.H / _h));
+                _ctx!.UpdateSubresource(sc, _cb!);
+                _ctx.PSSetShaderResources(0, none);
+                _ctx.OMSetRenderTargets(s0.rtv);
+                _ctx.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, sw, sh));
+                _ctx.PSSetShader(_psCrop);
+                _ctx.PSSetShaderResources(0, new[] { _srcView!, _identityLut!.Value.view });
+                _ctx.Draw(3, 0);
+                // passes
+                Vector4 Size(int w, int h) => new(w, h, 1f / w, 1f / h);
+                _ctx.PSSetConstantBuffer(0, _cbGraph);
+                foreach (var ps in g.Passes)
+                {
+                    var o = _graphTex[ps.Output];
+                    var ins = ps.Inputs.Select(n => _graphTex[n]).ToArray();
+                    _ctx.UpdateSubresource(new GraphConstants { OutSize = Size(o.w, o.h), In0Size = Size(ins[0].w, ins[0].h), SrcSize = Size(sw, sh) }, _cbGraph!);
+                    _ctx.PSSetShaderResources(0, none);
+                    _ctx.OMSetRenderTargets(o.rtv);
+                    _ctx.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, o.w, o.h));
+                    _ctx.PSSetShader(_psGraph[ps.Entry]);
+                    _ctx.PSSetShaderResources(0, ins.Select(t => t.srv).ToArray());
+                    _ctx.Draw(3, 0);
+                }
+                _ctx.PSSetShaderResources(0, none);
+                _ctx.PSSetConstantBuffer(0, _cb);
+                _ctx.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, _w, _h));
+                var outT = _graphTex["OUT"];
+                sc.Texel = new Vector4(1f / outT.w, 1f / outT.h, 0, 1);
+                sc.A = new Vector4(0, 0, 1, 1);
+                return outT.srv;
+            }
+
+            void ReleaseNisOut()
+            {
+                _nisOutUav?.Dispose(); _nisOutUav = null; _nisOutView?.Dispose(); _nisOutView = null; _nisOut?.Dispose(); _nisOut = null;
+                _nisW = _nisH = 0;
+            }
+
+            /// <summary>
+            /// NVIDIA NIS on the source rect of the capture into an output ≤ 2× the source (NIS's limit),
+            /// then sc is rewritten so the next draw places that output on the destination rect.
+            /// </summary>
+            void NisScale(ScaleMath.Rect src, ScaleMath.Rect dst, float sharpness, ref Constants sc)
+            {
+                int ow = (int)Math.Min(dst.W, src.W * 2), oh = (int)Math.Min(dst.H, src.H * 2);
+                ow = Math.Max(ow, (int)src.W); oh = Math.Max(oh, (int)src.H);
+                if (_nisOut == null || ow != _nisW || oh != _nisH)
+                {
+                    ReleaseNisOut();
+                    _nisOut = _dev!.CreateTexture2D(new Texture2DDescription
+                    {
+                        Width = (uint)ow, Height = (uint)oh, MipLevels = 1, ArraySize = 1, Format = Format.R16G16B16A16_Float,
+                        SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource | BindFlags.UnorderedAccess,
+                    });
+                    _nisOutView = _dev.CreateShaderResourceView(_nisOut);
+                    _nisOutUav = _dev.CreateUnorderedAccessView(_nisOut);
+                    _nisW = ow; _nisH = oh;
+                }
+                var c = NisConfig(sharpness, (uint)src.X, (uint)src.Y, (uint)src.W, (uint)src.H, (uint)_w, (uint)_h, (uint)ow, (uint)oh);
+                _ctx!.UpdateSubresource(c, _cbNis!);
+                _ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                _ctx.OMSetRenderTargets(new ID3D11RenderTargetView[] { null! });
+                _ctx.CSSetShader(_csNis);
+                _ctx.CSSetConstantBuffer(0, _cbNis);
+                _ctx.CSSetSampler(0, _linear!);
+                _ctx.CSSetShaderResources(0, new[] { _srcView!, _nisCoefSView!, _nisCoefUView! });
+                _ctx.CSSetUnorderedAccessView(0, _nisOutUav!);
+                _ctx.Dispatch((uint)((ow + 31) / 32), (uint)((oh + 23) / 24), 1);
+                _ctx.CSSetUnorderedAccessView(0, null!);
+                _ctx.CSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null!, null! });
+                _ctx.CSSetShader(null);
+                // place: whole NIS output → destination rect
+                sc.Texel = new Vector4(1f / ow, 1f / oh, 0, 1);
+                sc.A = new Vector4(0, 0, 1, 1);
             }
 
             /// <summary>Client area of the scaled window, in this monitor's pixels (false = hide, with a reason).</summary>
@@ -1075,6 +1422,9 @@ float4 PS_ScaleLanczos(V i) : SV_Target
     }
     return float4(clamp(acc / wsum, mn, mx), 1);
 }
+
+// crop the source rect (A, in uv) out of the capture at native size: input of the multi-pass upscalers
+float4 PS_Crop(V i) : SV_Target { return float4(Src.SampleLevel(Pt, A.xy + i.uv * A.zw, 0).rgb, 1); }
 
 // cursor quad: drawn with its own viewport, premultiplied alpha
 float4 PS_Cursor(V i) : SV_Target { return Src.SampleLevel(Lin, i.uv, 0); }
