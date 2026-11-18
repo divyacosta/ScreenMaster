@@ -10,7 +10,7 @@ Camadas de ajuste estilo Photoshop para a área de trabalho inteira do Windows: 
 - **Monitor (DDC/CI):** brilho, contraste e cor dentro do próprio monitor
 - **Sistema:** tema claro/escuro do Windows
 - **Shader (experimental):** Pesquisa de cores (LUT 3D `.cube`), Cor seletiva, Nitidez / Clareza / Remover névoa, com custo de GPU medido por camada
-- **Modo escala (experimental):** amplia a janela de um jogo para a tela inteira (Bilinear, Bicúbico, Lanczos + nitidez RCAS), com proporção, escala inteira e cursor mapeado
+- **Modo escala (experimental):** amplia a janela de um jogo para a tela inteira (Bilinear, Bicúbico, Lanczos 3, AMD FSR 1 e Snapdragon GSR, com nitidez RCAS do FSR 1), com proporção, escala inteira e cursor mapeado
 - **Agenda:** automações por horário e por dia da semana; **regras por programa** trocam preset, pausam a agenda ou ligam o modo escala
 
 ## Atalhos

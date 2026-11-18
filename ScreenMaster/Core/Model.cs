@@ -496,7 +496,7 @@ namespace ScreenMaster.Core
         public int ScaleAspect { get; set; }
         public bool ScaleInteger { get; set; }
         /// <summary>Index into ScaleMath.Filters, and RCAS sharpening after scaling (0 = off, 100 = max).</summary>
-        public int ScaleFilter { get; set; } = 2;
+        public int ScaleFilter { get; set; } = 3;
         public double ScaleSharpen { get; set; } = 40;
         public bool StartMinimized { get; set; }
         public bool CloseToTray { get; set; } = true;

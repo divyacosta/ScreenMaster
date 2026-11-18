@@ -110,7 +110,7 @@ namespace ScreenMaster.Engines
         public static string Check()
         {
             var sb = new System.Text.StringBuilder();
-            try { var all = new[] { "VS", "PS_Cursor", "PS_Rcas" }.Concat(ScaleMath.FilterEntries).Concat(PassEntries.Values).ToList(); foreach (var e in all) Bytecode(e); sb.AppendLine("hlsl: ok (" + all.Count + " shaders)"); }
+            try { var all = new[] { "VS", "PS_Cursor", "PS_FsrRcas" }.Concat(ScaleMath.FilterEntries).Concat(PassEntries.Values).ToList(); foreach (var e in all) Bytecode(e); sb.AppendLine("hlsl: ok (" + all.Count + " shaders)"); }
             catch (Exception ex) { sb.AppendLine("hlsl: FAIL " + ex.Message); }
             try
             {
@@ -149,7 +149,7 @@ namespace ScreenMaster.Engines
             using (dev) using (ctx)
             {
                 var px = new uint[W * H];
-                for (int i = 0; i < px.Length; i++) px[i] = 0xFF000000u | (uint)((i * 37) & 0xFF) << 16 | (uint)((i * 91) & 0xFF) << 8 | (uint)((i * 13) & 0xFF);
+                for (int i = 0; i < px.Length; i++) { int x = i % W, y = i / W; px[i] = 0xFF000000u | (uint)(x * 255 / (W - 1)) << 16 | (uint)(y * 255 / (H - 1)) << 8 | (uint)((x + y) * 255 / (W + H - 2)); }
                 Texture2DDescription D(BindFlags b, ResourceUsage u = ResourceUsage.Default, CpuAccessFlags c = CpuAccessFlags.None) => new()
                 { Width = W, Height = H, MipLevels = 1, ArraySize = 1, Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0), Usage = u, BindFlags = b, CPUAccessFlags = c };
                 ID3D11Texture2D src;
@@ -200,7 +200,36 @@ namespace ScreenMaster.Engines
                             ctx.Unmap(stage, 0);
                             res.Add($"{kind}={(worst <= 1 ? "ok" : "FAIL diff " + worst)}");
                         }
-                        return "passes: " + string.Join(", ", res);
+                        // scale filters at 1:1 must reproduce the image (small differences are normal for EASU/SGSR)
+                        var sres = new List<string>();
+                        for (int f = 0; f < ScaleMath.FilterEntries.Length; f++)
+                        {
+                            using var ps = dev.CreatePixelShader(Bytecode(ScaleMath.FilterEntries[f]));
+                            var c = new Constants
+                            {
+                                Texel = new Vector4(1f / W, 1f / H, 0, 1), A = new Vector4(0, 0, 1, 1), S0 = new Vector4(0, 0, W, H),
+                                S1 = new Vector4(1, 1, 0, 0), S2 = new Vector4(1f / W, 1f / H, 1f / W, -1f / H), S3 = new Vector4(-1f / W, 2f / H, 1f / W, 2f / H), S4 = new Vector4(0, 4f / H, 0, 0),
+                            };
+                            ctx.UpdateSubresource(c, cb);
+                            ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
+                            ctx.OMSetRenderTargets(rtv);
+                            ctx.PSSetShader(ps);
+                            ctx.PSSetShaderResources(0, new[] { srv, lutView });
+                            ctx.Draw(3, 0);
+                            ctx.CopyResource(stage, dst);
+                            var map = ctx.Map(stage, 0, MapMode.Read);
+                            double sum = 0; int n = 0;
+                            for (int y = 1; y < H - 1; y++)
+                                for (int x = 1; x < W - 1; x++)
+                                {
+                                    uint o = ((uint*)map.DataPointer)[y * (map.RowPitch / 4) + x], e = px[y * W + x];
+                                    for (int cc = 0; cc < 24; cc += 8) { sum += Math.Abs((int)((o >> cc) & 0xFF) - (int)((e >> cc) & 0xFF)); n++; }
+                                }
+                            ctx.Unmap(stage, 0);
+                            double avg = sum / n;
+                            sres.Add($"{ScaleMath.FilterEntries[f]}={(avg <= 6 ? "ok" : "FAIL")}({avg:0.0})");
+                        }
+                        return "passes: " + string.Join(", ", res) + Environment.NewLine + "scale filters 1:1: " + string.Join(", ", sres);
                     }
                 }
             }
@@ -264,6 +293,68 @@ namespace ScreenMaster.Engines
             [LayerKind.SelectiveColor] = "PS_Selective",
         };
 
+        static string Vendor(string path)
+        {
+            var asm = typeof(ShaderEngine).Assembly;
+            var name = asm.GetManifestResourceNames().FirstOrDefault(n => n.Replace('\\', '/').Equals("Vendor/" + path, StringComparison.OrdinalIgnoreCase))
+                       ?? throw new FileNotFoundException("recurso embutido ausente: " + path);
+            using var s = asm.GetManifestResourceStream(name)!;
+            using var r = new StreamReader(s);
+            return r.ReadToEnd();
+        }
+
+        /// <summary>Common declarations (cbuffer, textures, samplers, VS) shared by every shader source.</summary>
+        static string Common => Hlsl.Substring(0, Hlsl.IndexOf("float Luma(", StringComparison.Ordinal));
+
+        static string SourceFor(string entry) => entry switch
+        {
+            "PS_Easu" or "PS_FsrRcas" => Common + @"
+#define A_GPU 1
+#define A_HLSL 1
+" + Vendor("fsr/ffx_a.h") + @"
+#define FSR_EASU_F 1
+#define FSR_RCAS_F 1
+AF4 FsrEasuRF(AF2 p) { return Src.GatherRed(Pt, p); }
+AF4 FsrEasuGF(AF2 p) { return Src.GatherGreen(Pt, p); }
+AF4 FsrEasuBF(AF2 p) { return Src.GatherBlue(Pt, p); }
+AF4 FsrRcasLoadF(ASU2 p) { return Src.Load(int3(p, 0)); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+" + Vendor("fsr/ffx_fsr1.h") + @"
+// SR[0] = destination rect (output px), SR[1..4] = FsrEasuConOffset constants
+float4 PS_Easu(V i) : SV_Target
+{
+    float2 p = i.pos.xy - SR[0].xy;
+    if (any(p < 0) || any(p >= SR[0].zw)) return float4(0, 0, 0, 1);
+    AF3 c; FsrEasuF(c, AU2(p), asuint(SR[1]), asuint(SR[2]), asuint(SR[3]), asuint(SR[4]));
+    return float4(saturate(c), 1);
+}
+// A = FsrRcasCon constant (as float bits)
+float4 PS_FsrRcas(V i) : SV_Target
+{
+    AF1 r, g, b; FsrRcasF(r, g, b, AU2(i.pos.xy), asuint(A));
+    return float4(r, g, b, 1);
+}",
+            "PS_Sgsr" => Common + @"
+#define SGSR_MOBILE
+half4 SGSRRH(float2 p) { return Src.GatherRed(Lin, p); }
+half4 SGSRGH(float2 p) { return Src.GatherGreen(Lin, p); }
+half4 SGSRBH(float2 p) { return Src.GatherBlue(Lin, p); }
+half4 SGSRAH(float2 p) { return Src.GatherAlpha(Lin, p); }
+half4 SGSRRGBH(float2 p) { return Src.SampleLevel(Lin, p, 0); }
+half4 SGSRH(float2 p, uint channel) { if (channel == 0) return SGSRRH(p); if (channel == 1) return SGSRGH(p); if (channel == 2) return SGSRBH(p); return SGSRAH(p); }
+" + Vendor("sgsr/sgsr1_mobile.h") + @"
+// A = source rect in uv, SR[0] = destination rect; ViewportInfo = (1/texW, 1/texH, texW, texH)
+float4 PS_Sgsr(V i) : SV_Target
+{
+    float2 p = (i.pos.xy - SR[0].xy) / SR[0].zw;
+    if (any(p < 0) || any(p > 1)) return float4(0, 0, 0, 1);
+    half4 o = half4(0, 0, 0, 1);
+    SgsrYuvH(o, A.xy + p * A.zw, float4(Texel.xy, 1 / Texel.xy));
+    return float4(saturate(o.rgb), 1);
+}",
+            _ => Hlsl,
+        };
+
         static readonly Dictionary<string, byte[]> _bytecode = new();
         /// <summary>Compiled once per process (d3dcompiler_47 ships with Windows), shared by every device.</summary>
         static byte[] Bytecode(string entry)
@@ -271,7 +362,7 @@ namespace ScreenMaster.Engines
             lock (_bytecode)
             {
                 if (_bytecode.TryGetValue(entry, out var b)) return b;
-                b = Compiler.Compile(Hlsl, entry, "shader.hlsl", entry == "VS" ? "vs_5_0" : "ps_5_0").ToArray();
+                b = Compiler.Compile(SourceFor(entry), entry, entry + ".hlsl", entry == "VS" ? "vs_5_0" : "ps_5_0").ToArray();
                 _bytecode[entry] = b;
                 return b;
             }
@@ -364,7 +455,7 @@ namespace ScreenMaster.Engines
             int _timingIdx;
             // scale mode
             ID3D11PixelShader? _psCursor, _psRcas;
-            readonly ID3D11PixelShader?[] _psScale = new ID3D11PixelShader?[3];
+            readonly ID3D11PixelShader?[] _psScale = new ID3D11PixelShader?[ScaleMath.FilterEntries.Length];
             ID3D11BlendState? _blend;
             long _lastScaleRender;
             IntPtr _cursorHandle;
@@ -560,7 +651,7 @@ namespace ScreenMaster.Engines
                     _vs = _dev.CreateVertexShader(Bytecode("VS"));
                     foreach (var (k, e) in PassEntries) _ps[k] = _dev.CreatePixelShader(Bytecode(e));
                     for (int f = 0; f < _psScale.Length; f++) _psScale[f] = _dev.CreatePixelShader(Bytecode(ScaleMath.FilterEntries[f]));
-                    _psRcas = _dev.CreatePixelShader(Bytecode("PS_Rcas"));
+                    _psRcas = _dev.CreatePixelShader(Bytecode("PS_FsrRcas"));
                     _psCursor = _dev.CreatePixelShader(Bytecode("PS_Cursor"));
                     var bd = new BlendDescription();
                     bd.RenderTarget[0] = new RenderTargetBlendDescription
@@ -683,6 +774,12 @@ namespace ScreenMaster.Engines
                         A = new Vector4((float)(srcRect.X / _w), (float)(srcRect.Y / _h), (float)(srcRect.W / _w), (float)(srcRect.H / _h)),
                         S0 = new Vector4((float)dstRect.X, (float)dstRect.Y, (float)dstRect.W, (float)dstRect.H),
                     };
+                    // FsrEasuConOffset (AMD FSR 1): viewport = source rect, resource = captured monitor, output = destination rect
+                    float ivx = (float)srcRect.W, ivy = (float)srcRect.H, isx = _w, isy = _h, ox = (float)dstRect.W, oy = (float)dstRect.H;
+                    sc.S1 = new Vector4(ivx / ox, ivy / oy, 0.5f * ivx / ox - 0.5f + (float)srcRect.X, 0.5f * ivy / oy - 0.5f + (float)srcRect.Y);
+                    sc.S2 = new Vector4(1 / isx, 1 / isy, 1 / isx, -1 / isy);
+                    sc.S3 = new Vector4(-1 / isx, 2 / isy, 1 / isx, 2 / isy);
+                    sc.S4 = new Vector4(0, 4 / isy, 0, 0);
                     bool rcas = p.Scale!.Sharpen > 0;
                     _ctx.UpdateSubresource(sc, _cb!);
                     _ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
@@ -692,7 +789,7 @@ namespace ScreenMaster.Engines
                     _ctx.Draw(3, 0);
                     if (rcas)
                     {
-                        // RCAS: robust contrast-adaptive sharpening on the scaled image (0..100 → 2..0 stops)
+                        // AMD FSR 1 RCAS on the scaled image: 0..100 % → 2..0 stops (FsrRcasCon: con.x = exp2(-stops))
                         sc.A = new Vector4((float)Math.Pow(2, -2 * (1 - p.Scale.Sharpen / 100)), 0, 0, 0);
                         _ctx.UpdateSubresource(sc, _cb!);
                         _ctx.PSSetShaderResources(0, new ID3D11ShaderResourceView[] { null!, null! });
@@ -977,19 +1074,6 @@ float4 PS_ScaleLanczos(V i) : SV_Target
         if (x >= 0 && x <= 1 && y >= 0 && y <= 1) { mn = min(mn, c); mx = max(mx, c); }
     }
     return float4(clamp(acc / wsum, mn, mx), 1);
-}
-
-// RCAS-style sharpening (after AMD FidelityFX FSR 1 RCAS, MIT): A.x = sharpness 0..1
-float4 PS_Rcas(V i) : SV_Target
-{
-    float3 e = In(i);
-    float3 b = At(i.uv, float2(0, -1)), d = At(i.uv, float2(-1, 0)), f = At(i.uv, float2(1, 0)), h = At(i.uv, float2(0, 1));
-    float3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));
-    float3 hitMin = mn4 / (4 * mx4 + 1e-5);
-    float3 hitMax = (1 - mx4) / (4 * mn4 - 4 - 1e-5);
-    float3 lobeRGB = max(-hitMin, hitMax);
-    float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0)) * A.x;
-    return float4(saturate((lobe * (b + d + f + h) + e) / (4 * lobe + 1)), 1);
 }
 
 // cursor quad: drawn with its own viewport, premultiplied alpha

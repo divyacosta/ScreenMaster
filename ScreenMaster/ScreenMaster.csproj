@@ -23,6 +23,7 @@
 
   <ItemGroup>
     <Resource Include="Assets\MaterialSymbolsRounded.ttf" />
+    <EmbeddedResource Include="Vendor\**\*.h" LogicalName="Vendor/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>

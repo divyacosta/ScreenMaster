@@ -8,8 +8,8 @@ namespace ScreenMaster.Engines
     /// <summary>Pure geometry for the scale mode (tested by --shadercheck).</summary>
     public static class ScaleMath
     {
-        public static readonly string[] Filters = { "Bilinear (mais leve)", "Bicúbico (Catmull-Rom)", "Lanczos 3 (mais nítido)" };
-        public static readonly string[] FilterEntries = { "PS_Scale", "PS_ScaleBicubic", "PS_ScaleLanczos" };
+        public static readonly string[] Filters = { "Bilinear (mais leve)", "Bicúbico (Catmull-Rom)", "Lanczos 3", "AMD FSR 1 (EASU)", "Snapdragon GSR (leve)" };
+        public static readonly string[] FilterEntries = { "PS_Scale", "PS_ScaleBicubic", "PS_ScaleLanczos", "PS_Easu", "PS_Sgsr" };
         public static readonly string[] Aspects = { "Manter a da janela", "4:3", "16:9", "21:9", "Esticar (tela toda)" };
 
         public readonly record struct Rect(double X, double Y, double W, double H)
