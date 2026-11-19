@@ -458,7 +458,6 @@ namespace ScreenMaster.Core
         public bool HelpVisible { get; set; } = true;
         public bool AutoSwitch { get; set; } = true;
         public bool HideOverlayFromCapture { get; set; } = true;
-
         public bool StartMinimized { get; set; }
         public bool CloseToTray { get; set; } = true;
     }

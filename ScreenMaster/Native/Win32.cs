@@ -163,13 +163,6 @@ namespace ScreenMaster.Native
 
         // ---------------- magnification ----------------
         [DllImport("Magnification.dll", SetLastError = true)] public static extern bool MagInitialize();
-        [DllImport("Magnification.dll", SetLastError = true)] public static extern bool MagShowSystemCursor(bool show);
-        [DllImport("user32.dll")] public static extern bool ClipCursor(ref RECT r);
-        [DllImport("user32.dll", EntryPoint = "ClipCursor")] public static extern bool ClipCursorNone(IntPtr none);
-        [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
-        [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
-        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
-        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
         [DllImport("Magnification.dll", SetLastError = true)] public static extern bool MagUninitialize();
         [DllImport("Magnification.dll", SetLastError = true)] public static extern bool MagSetFullscreenColorEffect(ref MAGCOLOREFFECT effect);
         [DllImport("Magnification.dll", SetLastError = true)] public static extern bool MagGetFullscreenColorEffect(ref MAGCOLOREFFECT effect);

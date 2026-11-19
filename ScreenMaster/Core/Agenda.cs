@@ -133,7 +133,7 @@ namespace ScreenMaster.Core
         {
             yield return ("opacity", "Opacidade");
             foreach (var p in LayerDefs.Get(kind).Params)
-                if (p.Type is ParamType.Slider or ParamType.Toggle || (p.Type == ParamType.Choice && p.Key is not ("channel" or "range")))
+                if (p.Type is ParamType.Slider or ParamType.Toggle || (p.Type == ParamType.Choice && p.Key != "channel"))
                     yield return (p.Key, p.Label);
         }
 
