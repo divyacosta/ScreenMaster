@@ -57,7 +57,7 @@ namespace ScreenMaster.Engines
                 foreach (var m in monitors)
                 {
                     var passes = layers.Where(l => l.Enabled && l.Opacity > 0 && l.AppliesTo(m.DeviceName)
-                                                   && LayerDefs.Get(l.Kind).Engine == EngineKind.Shader
+                                                   && LayerDefs.Get(l.Kind).Engine == EngineKind.Shader && l.Kind != LayerKind.Scale
                                                    && (l.Kind != LayerKind.ColorLookup || File.Exists(l.GetS("file"))))
                                        .Select(l => l.CloneKeepId()).ToList();
                     var sc = scale != null && string.Equals(scale.Device, m.DeviceName, StringComparison.OrdinalIgnoreCase) ? scale : null;

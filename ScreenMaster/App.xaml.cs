@@ -330,6 +330,7 @@ namespace ScreenMaster
         public void ApplyNow()
         {
             if (_exiting) return;
+            EnsureScaleTimer();
             try
             {
                 Stack = Resolve();
@@ -507,7 +508,7 @@ namespace ScreenMaster
 
         public void PanicReset()
         {
-            _scaleHwnd = IntPtr.Zero; _scaleTimer?.Stop();
+            _scaleManual = IntPtr.Zero; _scalePaused = IntPtr.Zero;
             Settings.MasterEnabled = false;
             Simulated = null; _pinnedAt = null; Scrubbing = false;
             Bypass = false;
@@ -614,66 +615,114 @@ namespace ScreenMaster
 
         // ------------------------------------------------------------------ scale mode
 
-        /// <summary>The window being scaled (null = off). Scaling pauses while it is not in front.</summary>
-        IntPtr _scaleHwnd;
+        /// <summary>
+        /// Scale mode follows the "Modo escala" layer of the stack (like any other adjustment): it scales the
+        /// window in front — only the program whose rule switched this preset in, unless the layer says any window.
+        /// Ctrl+Alt+Shift+E pauses it for the window in front, or scales that window by hand when no layer asks for it.
+        /// </summary>
+        IntPtr _scaleManual, _scalePaused;
         System.Windows.Threading.DispatcherTimer? _scaleTimer;
-        public bool Scaling => _scaleHwnd != IntPtr.Zero;
+        string _scaleNote = "";
+        public bool Scaling => Engine.Scale != null;
+
+        void EnsureScaleTimer()
+        {
+            if (_scaleTimer != null) return;
+            _scaleTimer = new System.Windows.Threading.DispatcherTimer(TimeSpan.FromMilliseconds(500), System.Windows.Threading.DispatcherPriority.Normal, (_, _) => ScaleTick(), Dispatcher);
+            _scaleTimer.Start();
+        }
+
+        Layer? ScaleLayer => Stack.Effective.LastOrDefault(l => l.Enabled && l.Kind == LayerKind.Scale && l.Opacity > 0);
 
         public void ToggleScale()
         {
-            if (Scaling) { StopScale("Modo escala desligado."); return; }
             if (!Settings.MasterEnabled) { _tray?.Notify("Ligue os ajustes (Ctrl+Alt+Shift+S) antes de usar o modo escala."); return; }
-            var h = Native.Win32.GetForegroundWindow();
-            Native.Win32.GetWindowThreadProcessId(h, out var pid);
-            if (h == IntPtr.Zero || pid == Environment.ProcessId) { _tray?.Notify("Deixe o jogo/programa em primeiro plano e aperte Ctrl+Alt+Shift+E."); return; }
-            StartScale(h);
-        }
-
-        void StartScale(IntPtr h)
-        {
-            _scaleHwnd = h;
-            _scaleTimer ??= new System.Windows.Threading.DispatcherTimer(TimeSpan.FromMilliseconds(500), System.Windows.Threading.DispatcherPriority.Normal, (_, _) => ScaleTick(), Dispatcher);
-            _scaleTimer.Start();
+            var fg = Native.Win32.GetForegroundWindow();
+            if (Scaling)
+            {
+                // pause: this window stays unscaled until the hotkey is pressed again with it in front (or it closes)
+                _scalePaused = Engine.Scale!.Hwnd; _scaleManual = IntPtr.Zero;
+                _tray?.Notify("Modo escala pausado nesta janela (Ctrl+Alt+Shift+E retoma).");
+            }
+            else if (_scalePaused != IntPtr.Zero && _scalePaused == fg) { _scalePaused = IntPtr.Zero; _tray?.Notify("Modo escala retomado."); }
+            else if (Eligible(fg)) { _scaleManual = fg; _scalePaused = IntPtr.Zero; _tray?.Notify("Modo escala ligado nesta janela (Ctrl+Alt+Shift+E pausa)."); }
+            else { _tray?.Notify("Deixe o jogo em janela, em primeiro plano, e aperte Ctrl+Alt+Shift+E."); return; }
             ScaleTick();
-            _tray?.Notify("Modo escala ligado (Ctrl+Alt+Shift+E desliga). Deixe o jogo em janela.");
         }
 
-        public void StopScale(string? note = null)
+        /// <summary>A normal top-level window of another program, smaller than its monitor (otherwise there is nothing to enlarge).</summary>
+        bool Eligible(IntPtr h)
         {
-            _scaleHwnd = IntPtr.Zero;
-            _scaleTimer?.Stop();
-            _scaleNote = "";
-            Engine.SetScale(null);
-            ApplyNow();
-            if (note != null) _tray?.Notify(note);
+            if (h == IntPtr.Zero || !Native.Win32.IsWindow(h)) return false;
+            Native.Win32.GetWindowThreadProcessId(h, out var pid);
+            if (pid == 0 || pid == Environment.ProcessId) return false;
+            var cls = new System.Text.StringBuilder(64);
+            GetClassName(h, cls, cls.Capacity);
+            if (cls.ToString() is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd" or "Windows.UI.Core.CoreWindow") return false;
+            if (!Native.Win32.GetClientRect(h, out var cr) || cr.Width < 160 || cr.Height < 120) return false;
+            var mon = MonitorOf(h);
+            return mon != null && (cr.Width < mon.Bounds.Width || cr.Height < mon.Bounds.Height);
+        }
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int max);
+
+        Native.MonitorInfo? MonitorOf(IntPtr h)
+        {
+            Native.Win32.GetWindowRect(h, out var wr);
+            int cx = wr.Left + wr.Width / 2, cy = wr.Top + wr.Height / 2;
+            return Engine.Monitors.FirstOrDefault(m => cx >= m.Bounds.Left && cx < m.Bounds.Left + m.Bounds.Width && cy >= m.Bounds.Top && cy < m.Bounds.Top + m.Bounds.Height);
         }
 
-        /// <summary>Follows the scaled window: pauses when it leaves the front (mouse freed), resumes when it returns.</summary>
+        static string ProcessOf(IntPtr h)
+        {
+            try { Native.Win32.GetWindowThreadProcessId(h, out var pid); using var p = System.Diagnostics.Process.GetProcessById((int)pid); return p.ProcessName; }
+            catch { return ""; }
+        }
+
+        /// <summary>Every 0.5 s and on focus changes: decides which window (if any) is scaled and keeps the mouse in it.</summary>
         void ScaleTick()
         {
-            if (!Scaling) return;
-            if (!Settings.MasterEnabled) { StopScale(); return; }
-            if (!Native.Win32.IsWindow(_scaleHwnd)) { StopScale("A janela escalada foi fechada."); return; }
-            bool front = Native.Win32.GetForegroundWindow() == _scaleHwnd;
-            if (!front)
+            if (_exiting) return;
+            var fg = Native.Win32.GetForegroundWindow();
+            if (_scalePaused != IntPtr.Zero && !Native.Win32.IsWindow(_scalePaused)) _scalePaused = IntPtr.Zero;
+            if (_scaleManual != IntPtr.Zero && !Native.Win32.IsWindow(_scaleManual)) _scaleManual = IntPtr.Zero;
+
+            var layer = ScaleLayer;
+            IntPtr target = IntPtr.Zero;
+            if (Settings.MasterEnabled && fg != _scalePaused)
             {
-                if (Engine.Scale != null) { Engine.SetScale(null); ApplyNow(); }
-                return;
+                if (_scaleManual != IntPtr.Zero && fg == _scaleManual) target = fg;
+                else if (layer != null && Eligible(fg))
+                {
+                    bool any = layer.Get("target") > 0.5;
+                    if (any || (AppName != null && ProcessOf(fg).Equals(AppName, StringComparison.OrdinalIgnoreCase))) target = fg;
+                }
             }
-            Native.Win32.GetWindowRect(_scaleHwnd, out var wr);
-            int cx = wr.Left + wr.Width / 2, cy = wr.Top + wr.Height / 2;
-            var mon = Engine.Monitors.FirstOrDefault(m => cx >= m.Bounds.Left && cx < m.Bounds.Left + m.Bounds.Width && cy >= m.Bounds.Top && cy < m.Bounds.Top + m.Bounds.Height);
-            if (mon == null) return;
-            var spec = new Engines.ScaleSpec(_scaleHwnd, mon.DeviceName, Math.Clamp(Settings.ScaleAspect, 0, Engines.ScaleMath.Aspects.Length - 1), Settings.ScaleInteger,
-                Math.Clamp(Settings.ScaleFilter, 0, Engines.ScaleMath.Filters.Length - 1), Math.Clamp(Settings.ScaleSharpen, 0, 100));
+
+            ScaleSpec? spec = null;
+            Native.MonitorInfo? mon = target != IntPtr.Zero ? MonitorOf(target) : null;
+            if (mon != null)
+            {
+                var l = layer ?? Layer.Create(LayerKind.Scale);
+                spec = new ScaleSpec(target, mon.DeviceName,
+                    Math.Clamp((int)l.Get("aspect"), 0, ScaleMath.Aspects.Length - 1), l.Get("integer") > 0.5,
+                    Math.Clamp((int)l.Get("filter"), 0, ScaleMath.Filters.Length - 1), Math.Clamp(l.Get("sharpen"), 0, 100));
+            }
             if (Engine.Scale != spec) { Engine.SetScale(spec); ApplyNow(); }
             Engine.SyncScaleCursor();
+            if (spec == null) { _scaleNote = ""; return; }
             // tell once why the scaled image is not showing (the mouse is already free)
-            var err = Engine.Shader.ErrorOf(mon.DeviceName);
-            if (!Engine.Shader.IsShowing(mon.DeviceName) && err.Length > 0 && err != _scaleNote) { _scaleNote = err; _tray?.Notify(err); }
-            else if (Engine.Shader.IsShowing(mon.DeviceName)) _scaleNote = "";
+            var err = Engine.Shader.ErrorOf(spec.Device);
+            if (!Engine.Shader.IsShowing(spec.Device) && err.Length > 0 && err != _scaleNote) { _scaleNote = err; _tray?.Notify(err); }
+            else if (Engine.Shader.IsShowing(spec.Device)) _scaleNote = "";
         }
-        string _scaleNote = "";
+
+        /// <summary>Stops scaling right away (master off, panic).</summary>
+        public void StopScale()
+        {
+            _scaleManual = IntPtr.Zero; _scaleNote = "";
+            if (Engine.Scale != null) { Engine.SetScale(null); ApplyNow(); }
+        }
 
         string? _lastProcess;
 
@@ -682,7 +731,7 @@ namespace ScreenMaster
         void OnForegroundChanged(string process)
         {
             if (_exiting) return;
-            if (Scaling) Dispatcher.BeginInvoke(ScaleTick); // Alt+Tab frees the mouse right away
+            Dispatcher.BeginInvoke(ScaleTick); // Alt+Tab frees the mouse right away; a new window may be the one to scale
             _lastProcess = process;
             var rule = Settings.AutoSwitch
                 ? Settings.AppRules.FirstOrDefault(r => r.Process.Equals(process, StringComparison.OrdinalIgnoreCase))
@@ -690,17 +739,12 @@ namespace ScreenMaster
             var preset = rule?.Preset != null ? Settings.Presets.FirstOrDefault(p => p.Name == rule.Preset) : null;
             var paused = rule?.PauseAgenda == true ? process : null;
             var prof = rule?.Profile;
-            if (preset == AppPreset && paused == PausedByApp && prof == AppProfile && ((preset == null && prof == null) || AppName == process) && rule?.Scale != true) return;
+            if (preset == AppPreset && paused == PausedByApp && prof == AppProfile && ((preset == null && prof == null) || AppName == process)) return;
             if (rule != null) Log.Write($"program rule: {process} -> preset={preset?.Name ?? "-"} pause={paused != null}");
             AppPreset = preset;
             AppName = preset != null || prof != null ? process : null;
             PausedByApp = paused;
             AppProfile = prof;
-            if (rule?.Scale == true && !Scaling)
-            {
-                var h = Native.Win32.GetForegroundWindow();
-                if (h != IntPtr.Zero) StartScale(h);
-            }
             ApplyNow();
             StateChanged?.Invoke();
         }

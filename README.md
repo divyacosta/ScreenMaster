@@ -10,8 +10,8 @@ Camadas de ajuste estilo Photoshop para a área de trabalho inteira do Windows: 
 - **Monitor (DDC/CI):** brilho, contraste e cor dentro do próprio monitor
 - **Sistema:** tema claro/escuro do Windows
 - **Shader (experimental):** Pesquisa de cores (LUT 3D `.cube`), Cor seletiva, Nitidez / Clareza / Remover névoa, com custo de GPU medido por camada
-- **Modo escala (experimental):** amplia a janela de um jogo para a tela inteira (Bilinear, Bicúbico, Lanczos 3, AMD FSR 1, Snapdragon GSR, NVIDIA NIS, Super xBR e Anime4K CNN, com nitidez RCAS do FSR 1), com proporção, escala inteira e cursor mapeado
-- **Agenda:** automações por horário e por dia da semana; **regras por programa** trocam preset, pausam a agenda ou ligam o modo escala
+- **Modo escala (camada Shader, experimental):** amplia a janela de um jogo para a tela inteira (Bilinear, Bicúbico, Lanczos 3, AMD FSR 1, Snapdragon GSR, NVIDIA NIS, Super xBR e Anime4K CNN, com nitidez RCAS do FSR 1), com proporção, escala inteira e cursor mapeado
+- **Agenda:** automações por horário e por dia da semana; **regras por programa** trocam preset (inclusive um com Modo escala) ou pausam a agenda
 
 ## Atalhos
 | Atalho | Ação |
@@ -19,7 +19,7 @@ Camadas de ajuste estilo Photoshop para a área de trabalho inteira do Windows: 
 | Ctrl+Alt+Shift+S | liga/desliga os ajustes |
 | Ctrl+Alt+Shift+P | próximo preset |
 | Ctrl+Alt+Shift+B | antes/depois |
-| Ctrl+Alt+Shift+E | modo escala na janela em primeiro plano |
+| Ctrl+Alt+Shift+E | modo escala: pausa/retoma, ou liga na janela da frente |
 | Ctrl+Alt+Shift+R | restaurar a tela (emergência) |
 
 ## Compilar

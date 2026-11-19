@@ -21,7 +21,9 @@ namespace ScreenMaster.Core
         // v8 additions
         Pattern, GradientMap,
         // Shader engine (experimental, per monitor)
-        ColorLookup, SelectiveColor, Sharpen
+        ColorLookup, SelectiveColor, Sharpen,
+        // scale mode (shader engine, drives the window scaling instead of a pass)
+        Scale
     }
 
     public enum EngineKind { Matrix, Gamma, Driver, Overlay, Hardware, System, Shader }
@@ -102,6 +104,7 @@ namespace ScreenMaster.Core
             }
             return list.ToArray();
         }
+        public static readonly string[] ScaleTargets = { "Só o programa da regra deste preset", "Qualquer janela em primeiro plano" };
         public static readonly string[] PatternTypes = { "Pontos", "Linhas", "Xadrez", "Scanlines", "Trama cruzada", "Diagonais" };
 
         public static readonly LayerDef[] All =
@@ -292,6 +295,15 @@ namespace ScreenMaster.Core
                     new ParamDef("sharpen", "Nitidez", ParamType.Slider, 0, 100, 40, 1, Unit: "%"),
                     new ParamDef("clarity", "Clareza", ParamType.Slider, -100, 100, 0, 1),
                     new ParamDef("dehaze", "Remover névoa", ParamType.Slider, -100, 100, 0, 1),
+                } },
+            new() { Kind = LayerKind.Scale, Name = "Modo escala", Group = "Shader", Engine = EngineKind.Shader, Unique = true,
+                Hint = "Experimental: amplia a janela de um jogo (em janela, resolução menor) para a tela inteira. Coloque num preset ligado a um programa em “Ativar com programas”. O mouse fica preso na janela; Alt+Tab solta. Ctrl+Alt+Shift+E pausa/retoma.",
+                Params = new[] {
+                    new ParamDef("target", "Janela", ParamType.Choice, 0, 1, 0, Choices: ScaleTargets),
+                    new ParamDef("filter", "Ampliação", ParamType.Choice, 0, 20, 3, Choices: Engines.ScaleMath.Filters),
+                    new ParamDef("sharpen", "Nitidez depois de ampliar", ParamType.Slider, 0, 100, 40, 1, Unit: "%"),
+                    new ParamDef("aspect", "Proporção", ParamType.Choice, 0, 4, 0, Choices: Engines.ScaleMath.Aspects),
+                    new ParamDef("integer", "Escala inteira (2×, 3×…; só com “Manter a da janela”)", ParamType.Toggle, 0, 1, 0),
                 } },
             new() { Kind = LayerKind.WindowsTheme, Name = "Tema do Windows", Group = "Sistema", Engine = EngineKind.System, Unique = true,
                 Hint = "Troca o tema claro/escuro do Windows. Combine com a agenda: claro de dia, escuro à noite. Ao sair do preset, volta ao tema que estava.",
@@ -492,12 +504,7 @@ namespace ScreenMaster.Core
         public bool HelpVisible { get; set; } = true;
         public bool AutoSwitch { get; set; } = true;
         public bool HideOverlayFromCapture { get; set; } = true;
-        /// <summary>Scale mode: index into ScaleMath.Aspects, and integer (2×, 3×…) scaling.</summary>
-        public int ScaleAspect { get; set; }
-        public bool ScaleInteger { get; set; }
-        /// <summary>Index into ScaleMath.Filters, and RCAS sharpening after scaling (0 = off, 100 = max).</summary>
-        public int ScaleFilter { get; set; } = 3;
-        public double ScaleSharpen { get; set; } = 40;
+
         public bool StartMinimized { get; set; }
         public bool CloseToTray { get; set; } = true;
     }

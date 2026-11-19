@@ -48,7 +48,8 @@ namespace ScreenMaster.UI
                 S(EngineKind.Shader,
                     new Entry("Pesquisa de cores (LUT .cube)", LayerKind.ColorLookup, Alias: "Color Lookup LUT cube"),
                     new Entry("Cor seletiva", LayerKind.SelectiveColor, Alias: "Selective Color"),
-                    new Entry("Nitidez e remover névoa", LayerKind.Sharpen, Alias: "Sharpen Clarity dehaze")),
+                    new Entry("Nitidez e remover névoa", LayerKind.Sharpen, Alias: "Sharpen Clarity dehaze"),
+                    new Entry("Modo escala (ampliar janela)", LayerKind.Scale, Alias: "Scale upscale FSR NIS Anime4K xBR Lossless")),
             };
         }
 

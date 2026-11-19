@@ -112,25 +112,6 @@ namespace ScreenMaster
             }));
             root.Children.Add(Note("Com isso ligado, a sobreposição aparece só para você: Print Screen, OBS e Discord capturam a tela sem ela."));
 
-            root.Children.Add(Caption("Modo escala (Ctrl+Alt+Shift+E · experimental)"));
-            var aspect = new ComboBox { ItemsSource = Engines.ScaleMath.Aspects, SelectedIndex = Math.Clamp(s.ScaleAspect, 0, Engines.ScaleMath.Aspects.Length - 1), Margin = new Thickness(0, 0, 0, 8) };
-            aspect.SelectionChanged += (_, _) => { s.ScaleAspect = aspect.SelectedIndex; App.Ctl.ScheduleSave(); };
-            root.Children.Add(new TextBlock { Text = "Proporção", Foreground = DialogStyle.Res("Dim"), Margin = new Thickness(0, 0, 0, 4) });
-            root.Children.Add(aspect);
-            var filter = new ComboBox { ItemsSource = Engines.ScaleMath.Filters, SelectedIndex = Math.Clamp(s.ScaleFilter, 0, Engines.ScaleMath.Filters.Length - 1), Margin = new Thickness(0, 0, 0, 8) };
-            filter.SelectionChanged += (_, _) => { s.ScaleFilter = filter.SelectedIndex; App.Ctl.ScheduleSave(); };
-            root.Children.Add(new TextBlock { Text = "Ampliação", Foreground = DialogStyle.Res("Dim"), Margin = new Thickness(0, 0, 0, 4) });
-            root.Children.Add(filter);
-            var sharpLabel = new TextBlock { Foreground = DialogStyle.Res("Dim"), Margin = new Thickness(0, 0, 0, 4) };
-            void SharpText() => sharpLabel.Text = $"Nitidez depois de ampliar (RCAS): {s.ScaleSharpen:0}%";
-            SharpText();
-            var sharp = new Slider { Minimum = 0, Maximum = 100, Value = s.ScaleSharpen, SmallChange = 5, LargeChange = 10, Margin = new Thickness(0, 0, 0, 8) };
-            sharp.ValueChanged += (_, e) => { s.ScaleSharpen = Math.Round(e.NewValue); SharpText(); App.Ctl.ScheduleSave(); };
-            root.Children.Add(sharpLabel);
-            root.Children.Add(sharp);
-            root.Children.Add(Check("Escala inteira (2×, 3×…, sem borrão; bom para pixel art; só com “Manter a da janela”)", s.ScaleInteger, v => { s.ScaleInteger = v; App.Ctl.ScheduleSave(); }));
-            root.Children.Add(Note("Deixe o jogo em janela numa resolução menor e aperte o atalho com ele em primeiro plano. O mouse fica preso na janela e anda mais rápido na imagem ampliada. Alt+Tab solta o mouse."));
-
             root.Children.Add(Caption("Localização para nascer e pôr do sol"));
             var place = new TextBlock { FontSize = 14, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
             var find = new Button { Content = "Buscar pela internet", Margin = new Thickness(10, 0, 0, 0) };

@@ -930,15 +930,8 @@ namespace ScreenMaster
                 var g2 = new Grid { Margin = new Thickness(0, 0, 0, 10) };
                 g2.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
                 g2.ColumnDefinitions.Add(new ColumnDefinition());
-                g2.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 Grid.SetColumn(profCombo, 1);
                 g2.Children.Add(profCombo);
-                var scale = new CheckBox { Content = "escalar", IsChecked = rule.Scale, Margin = new Thickness(8, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center,
-                                           ToolTip = "Modo escala: amplia a janela deste programa para a tela inteira quando ele estiver na frente." };
-                scale.Checked += (_, _) => { rule.Scale = true; RulesChanged(); };
-                scale.Unchecked += (_, _) => { rule.Scale = false; RulesChanged(); };
-                Grid.SetColumn(scale, 2);
-                g2.Children.Add(scale);
                 p.Children.Add(g2);
             }
             if (Ctl.Settings.AppRules.Count == 0) p.Children.Add(Ui.Note("Nenhuma regra ainda. Abra o programa (ou jogo) e escolha-o na lista acima."));

@@ -35,6 +35,7 @@ namespace ScreenMaster.Core
             [LayerKind.ColorLookup] = "Aplica uma LUT 3D (.cube) de verdade, como no DaVinci ou Photoshop: cada cor da tela vira a cor da tabela.",
             [LayerKind.SelectiveColor] = "Ajusta só uma faixa de cor (vermelhos, azuis, neutros…) somando ou tirando ciano, magenta, amarelo e preto, como no Photoshop.",
             [LayerKind.Sharpen] = "Nitidez adaptativa (realça bordas sem estourar), Clareza (contraste local nos meios-tons) e Remover névoa.",
+            [LayerKind.Scale] = "Amplia a janela de um jogo para a tela inteira com FSR 1, NIS, Anime4K, xBR e outros, como o Lossless Scaling. Rode o jogo em janela numa resolução menor.",
             [LayerKind.Threshold] = "Transforma tudo em preto ou branco puro a partir de um limiar.",
             [LayerKind.HueSaturation] = "Gira todas as cores no círculo cromático (Matiz), deixa as cores mais vivas ou mais cinzas (Saturação) e clareia/escurece tudo (Luminosidade).",
             [LayerKind.ColorBalance] = "Empurra a imagem para um lado de cada par de cores complementares (ciano/vermelho, magenta/verde, amarelo/azul).",

@@ -93,8 +93,6 @@ namespace ScreenMaster.Core
         public bool PauseAgenda { get; set; }
         /// <summary>Agenda profile to switch to while the program is in front; null = keep the chosen one.</summary>
         public Guid? Profile { get; set; }
-        /// <summary>Scale this program's window to the whole screen while it is in front (modo escala).</summary>
-        public bool Scale { get; set; }
     }
 
     public sealed class Location
