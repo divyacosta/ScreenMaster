@@ -98,7 +98,7 @@ namespace ScreenMaster
             Help.Set(UndoButton, new HelpInfo("Desfazer", "Volta a última alteração em presets, ajustes, agenda ou regras.", "Atalho: Ctrl+Z"));
             Help.Set(RedoButton, new HelpInfo("Refazer", "Refaz o que foi desfeito.", "Atalho: Ctrl+Y"));
             Help.Set(BypassButton, new HelpInfo("Antes/depois", "Segure para ver a tela sem os ajustes; solte para voltar. O brilho físico do monitor não muda (é lento e grava no monitor).",
-                "Atalhos: segure \\ nesta janela · Ctrl+Alt+Shift+B liga/desliga em qualquer lugar"));
+                "Atalho: segure \\ nesta janela"));
             PreviewMouseMove += OnHelpMouseMove;
             ShowHelp(null);
 
@@ -1072,46 +1072,6 @@ namespace ScreenMaster
         }
 
         /// <param name="track">Own agenda track, or a wrapper (preset layer + linked lanes) when <paramref name="linked"/>.</param>
-        System.Windows.Threading.DispatcherTimer? _costTimer;
-
-        FrameworkElement LutFileRow(Layer l)
-        {
-            // the built-in looks + the current file (if it is another one) + "Outro arquivo…"
-            var items = Engines.ShaderEngine.LutLibrary().Select(x => new Choice(x.path, x.title)).ToList();
-            var path = l.GetS("file");
-            if (path == "#FFFFFF") path = "";
-            if (path.Length > 0 && !items.Any(c => c.Key.Equals(path, StringComparison.OrdinalIgnoreCase)))
-            {
-                string title;
-                try { title = Engines.ShaderEngine.LoadCube(path).Title; } catch { title = System.IO.Path.GetFileNameWithoutExtension(path) + " (não encontrado)"; }
-                items.Insert(0, new Choice(path, title));
-            }
-            const string Other = "\u0001other";
-            items.Add(new Choice(Other, "Outro arquivo .cube…"));
-            var combo = new ComboBox { ItemsSource = items, DisplayMemberPath = "Label", MaxDropDownHeight = 420 };
-            combo.SelectedItem = items.FirstOrDefault(c => c.Key.Equals(path, StringComparison.OrdinalIgnoreCase));
-            var last = combo.SelectedItem;
-            combo.SelectionChanged += (_, _) =>
-            {
-                if (combo.SelectedItem is not Choice c || c == last) return;
-                var file = c.Key;
-                if (file == Other)
-                {
-                    var dlg = new Microsoft.Win32.OpenFileDialog { Filter = "LUT 3D (*.cube)|*.cube", Title = "Escolha uma LUT 3D" };
-                    if (dlg.ShowDialog(this) != true) { combo.SelectedItem = last; return; }
-                    try { Engines.ShaderEngine.LoadCube(dlg.FileName); }
-                    catch (Exception ex) { MessageBox.Show(this, "Não foi possível ler a LUT: " + ex.Message, "ScreenMaster"); combo.SelectedItem = last; return; }
-                    file = dlg.FileName;
-                }
-                l.S["file"] = file;
-                LayerEdited(l);
-                if (c.Key == Other) Dispatcher.BeginInvoke(() => ShowProps(l)); // the new file shows up in the list
-                else last = c;
-            };
-            Help.Set(combo, new HelpInfo("Look (LUT 3D)", "Escolha um dos looks prontos ou carregue um arquivo .cube seu (DaVinci, Photoshop, Premiere…). A opacidade mistura com a imagem original.", null));
-            return Ui.Row("Look", combo);
-        }
-
         void ShowProps(Layer? l, AgendaTrack? track = null, bool linked = false)
         {
             // A local layer automated by today's agenda: show it through its linked lanes.
@@ -1192,26 +1152,6 @@ namespace ScreenMaster
             Help.Set(opRow, () => ParamHelp(l, "opacity", "Opacidade"));
             PropsPanel.Children.Add(opRow);
 
-            if (l.Kind == LayerKind.ColorLookup) PropsPanel.Children.Add(LutFileRow(l));
-            _costTimer?.Stop();
-            if (def.Engine == EngineKind.Shader)
-            {
-                var cost = new TextBlock { Foreground = Ui.Res("Dim"), FontSize = 12, Margin = new Thickness(0, 0, 0, 12) };
-                void Tick()
-                {
-                    var t = Ctl.Engine.Shader.TimingsSnapshot();
-                    cost.Text = t.TryGetValue(l.Id, out var ms)
-                        ? $"Custo na GPU: {ms.ToString("0.00", System.Globalization.CultureInfo.GetCultureInfo("pt-BR"))} ms por quadro"
-                        : "Custo na GPU: medindo… (aparece quando a camada está na tela)";
-                }
-                Tick();
-                _costTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-                _costTimer.Tick += (_, _) => { if (cost.IsLoaded) Tick(); else _costTimer?.Stop(); };
-                _costTimer.Start();
-                Help.Set(cost, new HelpInfo("Custo na GPU", "Tempo que esta camada leva na placa de vídeo a cada quadro, medido de verdade. Acima de ~2 ms começa a pesar em jogos.", null));
-                PropsPanel.Children.Add(cost);
-            }
-
             CurveEditor? curve = null;
             foreach (var p in def.Params)
             {
@@ -1253,7 +1193,6 @@ namespace ScreenMaster
                         {
                             l.P[key] = combo.SelectedIndex;
                             if (def.HasCurve && curve != null) { curve.Channel = combo.SelectedIndex; Ctl.ScheduleSave(); }
-                            else if (l.Kind == LayerKind.SelectiveColor && key == "range") { Ctl.ScheduleSave(); Dispatcher.BeginInvoke(() => ShowProps(l, track, linked)); }
                             else Edited();
                         };
                         if (p.Optional)

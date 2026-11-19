@@ -45,11 +45,6 @@ namespace ScreenMaster.UI
                     new Entry("Guias e grade", LayerKind.Guides, Alias: "Guides grid"), new Entry("Padrão", LayerKind.Pattern, Alias: "Pattern scanlines dots")),
                 S(EngineKind.Hardware, new Entry("Monitor (brilho, contraste, cor…)", LayerKind.MonitorHardware, Alias: "Monitor DDC hardware")),
                 S(EngineKind.System, new Entry("Tema do Windows (claro/escuro)", LayerKind.WindowsTheme, Alias: "Windows theme dark light")),
-                S(EngineKind.Shader,
-                    new Entry("Pesquisa de cores (LUT .cube)", LayerKind.ColorLookup, Alias: "Color Lookup LUT cube"),
-                    new Entry("Cor seletiva", LayerKind.SelectiveColor, Alias: "Selective Color"),
-                    new Entry("Nitidez e remover névoa", LayerKind.Sharpen, Alias: "Sharpen Clarity dehaze"),
-                    new Entry("Modo escala (ampliar janela)", LayerKind.Scale, Alias: "Scale upscale FSR NIS Anime4K xBR Lossless")),
             };
         }
 

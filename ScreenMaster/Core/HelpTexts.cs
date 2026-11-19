@@ -8,8 +8,7 @@ namespace ScreenMaster.Core
     public static class HelpTexts
     {
         public static readonly HelpInfo Idle = new("Ajuda",
-            "Passe o mouse sobre um controle para ver o que ele faz. Ctrl+Z desfaz, segure \\ para comparar antes/depois, F1 esconde esta caixa.",
-            "Em qualquer programa: Ctrl+Alt+Shift+S liga/desliga, +P próximo preset, +B antes/depois, +E escalar a janela, +R restaurar a tela");
+            "Passe o mouse sobre um controle para ver o que ele faz. Ctrl+Z desfaz, segure \\ para comparar antes/depois, F1 esconde esta caixa.", null);
 
         public static string EngineFacts(EngineKind e, bool hideOverlayFromCapture) => e switch
         {
@@ -19,7 +18,6 @@ namespace ScreenMaster.Core
             EngineKind.Overlay => "Não aparece em tela cheia exclusiva · " + (hideOverlayFromCapture ? "escondido de prints" : "aparece em prints"),
             EngineKind.Hardware => "Ajuste dentro do monitor · funciona em tudo · não aparece em prints",
             EngineKind.System => "Configuração do Windows · todos os monitores · volta ao original ao sair",
-            EngineKind.Shader => "Experimental · não aparece em tela cheia exclusiva nem em prints · 1 quadro de atraso",
             _ => "",
         };
 
@@ -32,10 +30,6 @@ namespace ScreenMaster.Core
             [LayerKind.Posterize] = "Reduz a quantidade de tons por canal, criando faixas de cor chapadas.",
             [LayerKind.Pattern] = "Cobre a tela com uma textura repetida (pontos, linhas, xadrez, scanlines). Use opacidade baixa para um efeito de tela de CRT ou papel.",
             [LayerKind.GradientMap] = "Troca cada tom da tela por uma cor do degradê: sombras viram a primeira cor, altas luzes a última. Ótimo para looks duotone.",
-            [LayerKind.ColorLookup] = "Aplica uma LUT 3D (.cube) de verdade, como no DaVinci ou Photoshop: cada cor da tela vira a cor da tabela.",
-            [LayerKind.SelectiveColor] = "Ajusta só uma faixa de cor (vermelhos, azuis, neutros…) somando ou tirando ciano, magenta, amarelo e preto, como no Photoshop.",
-            [LayerKind.Sharpen] = "Nitidez adaptativa (realça bordas sem estourar), Clareza (contraste local nos meios-tons) e Remover névoa.",
-            [LayerKind.Scale] = "Amplia a janela de um jogo para a tela inteira com FSR 1, NIS, Anime4K, xBR e outros, como o Lossless Scaling. Rode o jogo em janela numa resolução menor.",
             [LayerKind.Threshold] = "Transforma tudo em preto ou branco puro a partir de um limiar.",
             [LayerKind.HueSaturation] = "Gira todas as cores no círculo cromático (Matiz), deixa as cores mais vivas ou mais cinzas (Saturação) e clareia/escurece tudo (Luminosidade).",
             [LayerKind.ColorBalance] = "Empurra a imagem para um lado de cada par de cores complementares (ciano/vermelho, magenta/verde, amarelo/azul).",
@@ -117,12 +111,12 @@ namespace ScreenMaster.Core
 
         public static readonly Dictionary<string, HelpInfo> Ui = new()
         {
-            ["master"] = new("Ajustes ligados", "Liga/desliga tudo de uma vez: preset local, agenda e ajustes do monitor. Desligado, a tela volta ao original.", "Atalho: Ctrl+Alt+Shift+S"),
-            ["reset"] = new("Restaurar tela", "Emergência: desliga todos os ajustes e devolve gama, vibração e monitor aos valores originais.", "Atalho: Ctrl+Alt+Shift+R"),
+            ["master"] = new("Ajustes ligados", "Liga/desliga tudo de uma vez: preset local, agenda e ajustes do monitor. Desligado, a tela volta ao original."),
+            ["reset"] = new("Restaurar tela", "Emergência: desliga todos os ajustes e devolve gama, vibração e monitor aos valores originais."),
             ["settings"] = new("Configurações", "Inicialização com o Windows, bandeja, esconder a sobreposição de prints, localização e faixa de gama."),
             ["tabLayers"] = new("Camadas", "Presets locais, a pilha de ajustes de cada um e as propriedades de cada ajuste."),
             ["tabMonitors"] = new("Monitores", "Ajustes internos de cada monitor (brilho, contraste, cor, entrada…) e resolução/frequência."),
-            ["presets"] = new("Presets locais", "O preset que você escolhe aqui é a base do que está na tela. Clique para aplicar e editar. A agenda soma por cima dele.", "Atalho: Ctrl+Alt+Shift+P passa para o próximo"),
+            ["presets"] = new("Presets locais", "O preset que você escolhe aqui é a base do que está na tela. Clique para aplicar e editar. A agenda soma por cima dele."),
             ["presetNew"] = new("Novo preset", "Cria um preset vazio e o aplica como local."),
             ["presetDup"] = new("Duplicar preset", "Copia o preset local com todos os ajustes."),
             ["presetRename"] = new("Renomear preset", "As regras por programa que usam este preset acompanham o novo nome."),

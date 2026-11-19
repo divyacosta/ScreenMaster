@@ -1,5 +1,7 @@
 # ScreenMaster — plano do modo shader e "tipo DLSS"
 
+> **Retirado em 19/11/2026.** O modo shader (captura da tela + redesenho) e o modo escala foram removidos do app por não funcionarem bem na prática, junto com os atalhos globais. O código está no histórico do git (até o commit `7445541`).
+
 Tudo experimental, desligado por padrão, fora dos presets padrão. Funciona só em janela/sem bordas e em monitor SDR.
 Antes de embutir qualquer código de terceiros: confirmar licença e anotar em `THIRD-PARTY.md`.
 

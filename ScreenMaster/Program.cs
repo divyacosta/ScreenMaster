@@ -12,12 +12,6 @@ namespace ScreenMaster
         {
             if (args.Contains("--selftest")) return SelfTest.Run();
             if (args.Contains("--probe")) return SelfTest.Probe();
-            if (args.Contains("--shadercheck"))
-            {
-                var r = Engines.ShaderEngine.Check();
-                System.IO.File.WriteAllText(System.IO.Path.Combine(Core.Paths.Dir, "shadercheck.txt"), r);
-                return r.Contains("FAIL") ? 1 : 0;
-            }
             if (args.Contains("--exit")) { Ipc.SignalExit(); return 0; }
             if (args.Contains("--restore"))
             {

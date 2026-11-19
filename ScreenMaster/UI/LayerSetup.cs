@@ -90,8 +90,6 @@ namespace ScreenMaster.UI
         /// <summary>Monitor adjustment params the chosen monitor supports (all of them while DDC info isn't known).</summary>
         public static bool Supports(Layer l, string key)
         {
-            if (l.Kind == LayerKind.SelectiveColor && key.Contains('_'))
-                return key.StartsWith(LayerDefs.SelectiveRanges[Math.Clamp((int)l.Get("range"), 0, 8)].key + "_");
             if (l.Kind != LayerKind.MonitorHardware || !LayerDefs.HardwareCodes.TryGetValue(key, out var code)) return true;
             if (l.Monitors.Count != 1 || !Ctl.Engine.Hardware.IsReady) return true;
             var ddc = Ctl.Engine.Hardware.Get(l.Monitors[0]);

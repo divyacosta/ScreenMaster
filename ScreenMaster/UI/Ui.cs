@@ -32,7 +32,6 @@ namespace ScreenMaster.UI
             EngineKind.Overlay when kind == LayerKind.Grain => (new[] { "CPU", "GPU" }, "leve, por ser animada"),
             EngineKind.Overlay => (new[] { "GPU" }, "quase sem custo"),
             EngineKind.Hardware => (new[] { "Monitor" }, "sem custo"),
-            EngineKind.Shader => (new[] { "GPU" }, "moderado: processa cada quadro"),
             _ => (new[] { "Windows" }, "sem custo"),
         };
 

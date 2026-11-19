@@ -14,44 +14,6 @@ namespace ScreenMaster.Engines
         public GammaEngine Gamma { get; }
         public VibranceEngine Vibrance { get; }
         public OverlayEngine Overlay { get; } = new();
-        public ShaderEngine Shader { get; } = new();
-
-        /// <summary>Scale mode target (null = off). Set with <see cref="SetScale"/>.</summary>
-        public ScaleSpec? Scale { get; private set; }
-        bool _cursorHidden;
-
-        /// <summary>Starts/stops scaling a window: the real cursor is clipped to it and hidden (a copy is drawn scaled).</summary>
-        public void SetScale(ScaleSpec? s)
-        {
-            Scale = s;
-            if (s == null) ReleaseCursor();
-        }
-
-        /// <summary>
-        /// Hides + clips the real cursor only while the scaled image is really on screen; otherwise frees it
-        /// (capture refused, DRM, UAC, watchdog…), so the mouse is never lost. Called every ~0.5 s while scaling.
-        /// </summary>
-        public void SyncScaleCursor()
-        {
-            if (Scale == null || !Shader.IsShowing(Scale.Device)) { ReleaseCursor(); return; }
-            ClipToScaled();
-            if (!_cursorHidden) _cursorHidden = Win32.MagShowSystemCursor(false);
-        }
-
-        void ClipToScaled()
-        {
-            if (Scale == null || !Win32.GetClientRect(Scale.Hwnd, out var cr)) return;
-            var pt = new POINT();
-            Win32.ClientToScreen(Scale.Hwnd, ref pt);
-            var r = new RECT { Left = pt.X, Top = pt.Y, Right = pt.X + cr.Width, Bottom = pt.Y + cr.Height };
-            Win32.ClipCursor(ref r);
-        }
-
-        void ReleaseCursor()
-        {
-            try { Win32.ClipCursorNone(IntPtr.Zero); } catch { }
-            if (_cursorHidden) { try { Win32.MagShowSystemCursor(true); } catch { } _cursorHidden = false; }
-        }
         public HardwareEngine Hardware { get; }
         public SystemEngine System { get; }
         public List<MonitorInfo> Monitors { get; private set; } = new();
@@ -211,18 +173,8 @@ namespace ScreenMaster.Engines
                 Hardware.SetTargets(dev, targets);
             }
 
-            // ---- shader (experimental): runs first so the overlay knows to hide itself from its capture
-            try { Shader.Update(Monitors, layers, Scale); } catch (Exception ex) { Log.Write("shader update: " + ex.Message); }
-            var shaderErrors = Shader.ErrorsSnapshot();
-            foreach (var l in layers.Where(l => l.Enabled && EngineOf(l) == EngineKind.Shader))
-            {
-                var err = Monitors.Where(m => l.AppliesTo(m.DeviceName)).Select(m => shaderErrors.GetValueOrDefault(m.DeviceName)).FirstOrDefault(e => !string.IsNullOrEmpty(e));
-                if (err != null) LayerErrors[l.Id] = err;
-                else if (l.Kind == LayerKind.ColorLookup && string.IsNullOrWhiteSpace(l.GetS("file"))) LayerErrors[l.Id] = "Escolha um look na lista “Look”.";
-            }
-
-            // ---- overlay (hidden from capture while the shader reads the screen, or it would be drawn twice)
-            Overlay.Update(Monitors, layers, hideOverlayFromCapture || Shader.Active);
+            // ---- overlay
+            Overlay.Update(Monitors, layers, hideOverlayFromCapture);
 
             // ---- Windows settings (theme)
             try { System.Apply(layers); } catch (Exception ex) { Log.Write("system apply: " + ex.Message); }
@@ -241,8 +193,6 @@ namespace ScreenMaster.Engines
             try { Gamma.RestoreAll(all: false); } catch (Exception ex) { Log.Write("gamma restore: " + ex.Message); }
             try { Vibrance.RestoreAll(all: false); } catch (Exception ex) { Log.Write("dvc restore: " + ex.Message); }
             try { Hardware.RestoreAll(all: false, wait: false); } catch (Exception ex) { Log.Write("ddc restore: " + ex.Message); }
-            Scale = null; ReleaseCursor();
-            try { Shader.Clear(); } catch (Exception ex) { Log.Write("shader clear: " + ex.Message); }
             try { Overlay.Clear(); } catch (Exception ex) { Log.Write("overlay clear: " + ex.Message); }
             try { System.Release(); } catch (Exception ex) { Log.Write("system restore: " + ex.Message); }
             if (State.Applied) { State.Applied = false; State.Save(); }
@@ -254,7 +204,6 @@ namespace ScreenMaster.Engines
             _shutdown = true;
             RestoreAll();
             try { Hardware.RestoreAll(all: false, wait: true); Hardware.Stop(); } catch { }
-            try { Shader.Stop(); } catch { }
             try { Overlay.Stop(); } catch { }
             try { Matrix.Shutdown(); } catch { }
             Log.Write("clean shutdown");

@@ -116,7 +116,7 @@ namespace ScreenMaster.UI
             var m = _icon.ContextMenuStrip!;
             m.Items.Clear();
             m.Items.Add("Abrir ScreenMaster", null, (_, _) => _app.ShowMain());
-            var master = new WinForms.ToolStripMenuItem("Ajustes ligados") { Checked = _app.Settings.MasterEnabled, ShortcutKeyDisplayString = "Ctrl+Alt+Shift+S" };
+            var master = new WinForms.ToolStripMenuItem("Ajustes ligados") { Checked = _app.Settings.MasterEnabled };
             master.Click += (_, _) => _app.SetMaster(!_app.Settings.MasterEnabled);
             m.Items.Add(master);
             var presets = new WinForms.ToolStripMenuItem("Preset local");
@@ -169,7 +169,7 @@ namespace ScreenMaster.UI
             agenda.DropDownItems.Add(use);
             m.Items.Add(agenda);
             m.Items.Add(new WinForms.ToolStripSeparator());
-            var reset = new WinForms.ToolStripMenuItem("Restaurar tela") { ShortcutKeyDisplayString = "Ctrl+Alt+Shift+R" };
+            var reset = new WinForms.ToolStripMenuItem("Restaurar tela");
             reset.Click += (_, _) => _app.PanicReset();
             m.Items.Add(reset);
             m.Items.Add("Sair", null, (_, _) => _app.ExitApp());
@@ -195,54 +195,6 @@ namespace ScreenMaster.UI
         {
             _icon.Visible = false;
             _icon.Dispose();
-        }
-    }
-
-    public enum HotkeyAction { Reset = 1, Toggle = 2, Next = 3, Bypass = 4, Scale = 5 }
-
-    /// <summary>Global hotkeys on a message-only window.</summary>
-    public sealed class HotkeyWindow : IDisposable
-    {
-        readonly HwndSource _src;
-        public event Action<HotkeyAction>? Pressed;
-        public List<string> Failed { get; } = new();
-
-        public HotkeyWindow()
-        {
-            var p = new HwndSourceParameters("ScreenMasterHotkeys") { ParentWindow = new IntPtr(-3), Width = 0, Height = 0, WindowStyle = 0 };
-            _src = new HwndSource(p);
-            _src.AddHook(Hook);
-            const uint mods = Win32.MOD_CONTROL | Win32.MOD_ALT | Win32.MOD_SHIFT | Win32.MOD_NOREPEAT;
-            Register(HotkeyAction.Reset, mods, 0x52, "Ctrl+Alt+Shift+R");
-            Register(HotkeyAction.Toggle, mods, 0x53, "Ctrl+Alt+Shift+S");
-            Register(HotkeyAction.Next, mods, 0x50, "Ctrl+Alt+Shift+P");
-            Register(HotkeyAction.Bypass, mods, 0x42, "Ctrl+Alt+Shift+B");
-            Register(HotkeyAction.Scale, mods, 0x45, "Ctrl+Alt+Shift+E");
-        }
-
-        void Register(HotkeyAction a, uint mods, uint vk, string label)
-        {
-            if (!Win32.RegisterHotKey(_src.Handle, (int)a, mods, vk))
-            {
-                Failed.Add(label);
-                Log.Write("hotkey failed: " + label);
-            }
-        }
-
-        IntPtr Hook(IntPtr hwnd, int msg, IntPtr w, IntPtr l, ref bool handled)
-        {
-            if (msg == (int)Win32.WM_HOTKEY)
-            {
-                Pressed?.Invoke((HotkeyAction)w.ToInt32());
-                handled = true;
-            }
-            return IntPtr.Zero;
-        }
-
-        public void Dispose()
-        {
-            foreach (HotkeyAction a in Enum.GetValues(typeof(HotkeyAction))) Win32.UnregisterHotKey(_src.Handle, (int)a);
-            _src.Dispose();
         }
     }
 

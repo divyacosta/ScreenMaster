@@ -20,13 +20,11 @@ namespace ScreenMaster.Core
         Temperature, LiftGammaGain, ColorBlind, Guides, WindowsTheme,
         // v8 additions
         Pattern, GradientMap,
-        // Shader engine (experimental, per monitor)
-        ColorLookup, SelectiveColor, Sharpen,
-        // scale mode (shader engine, drives the window scaling instead of a pass)
-        Scale
+        // removed in v9 (shader mode): kept only so old settings files still load; App.Migrate drops these layers
+        ColorLookup, SelectiveColor, Sharpen, Scale
     }
 
-    public enum EngineKind { Matrix, Gamma, Driver, Overlay, Hardware, System, Shader }
+    public enum EngineKind { Matrix, Gamma, Driver, Overlay, Hardware, System }
 
     public enum ParamType { Slider, Toggle, Color, Choice }
 
@@ -47,7 +45,6 @@ namespace ScreenMaster.Core
             new(EngineKind.Overlay, "Sobreposição", "por cima da tela · por monitor", "#D07A35"),
             new(EngineKind.Hardware, "Monitor", "interno do monitor · um por ajuste", "#3B8EEA"),
             new(EngineKind.System, "Sistema", "configuração do Windows", "#2AA7B8"),
-            new(EngineKind.Shader, "Shader", "experimental · processa a tela · por monitor", "#B0558F"),
         };
 
         public static Category Of(EngineKind e) => All.First(c => c.Engine == e);
@@ -73,7 +70,8 @@ namespace ScreenMaster.Core
 
     public static class LayerDefs
     {
-        const string ShaderHint = "Experimental: captura a tela e redesenha por cima (1 quadro de atraso, usa a GPU). Só em janela/sem bordas, monitor SDR; não aparece em prints.";
+        /// <summary>Layer kinds that no longer exist (shader mode, removed in v9).</summary>
+        public static bool Removed(LayerKind k) => k is LayerKind.ColorLookup or LayerKind.SelectiveColor or LayerKind.Sharpen or LayerKind.Scale;
         public static readonly string[] Channels = { "RGB", "Vermelho", "Verde", "Azul" };
 
         // Must be declared before All (static fields initialize in textual order).
@@ -83,28 +81,6 @@ namespace ScreenMaster.Core
         public static readonly string[] ColorBlindTypes = { "Protanopia (sem vermelho)", "Deuteranopia (sem verde)", "Tritanopia (sem azul)", "Acromatopsia (sem cor)" };
         public static readonly string[] GuideModes = { "Colunas", "Grade", "Centro", "Terços" };
         public static readonly string[] ThemeModes = { "Escuro", "Claro" };
-        public static readonly (string key, string name)[] SelectiveRanges =
-        {
-            ("red", "Vermelhos"), ("yellow", "Amarelos"), ("green", "Verdes"), ("cyan", "Cianos"), ("blue", "Azuis"),
-            ("magenta", "Magentas"), ("white", "Brancos"), ("neutral", "Neutros"), ("black", "Pretos"),
-        };
-        static ParamDef[] SelectiveParams()
-        {
-            var list = new List<ParamDef>
-            {
-                new("range", "Cores", ParamType.Choice, 0, 8, 0, Choices: SelectiveRanges.Select(r => r.name).ToArray()),
-                new("relative", "Relativo (proporcional à tinta que já existe)", ParamType.Toggle, 0, 1, 1),
-            };
-            foreach (var (k, n) in SelectiveRanges)
-            {
-                list.Add(new(k + "_c", $"Ciano ({n})", ParamType.Slider, -100, 100, 0, 1, Unit: "%"));
-                list.Add(new(k + "_m", $"Magenta ({n})", ParamType.Slider, -100, 100, 0, 1, Unit: "%"));
-                list.Add(new(k + "_y", $"Amarelo ({n})", ParamType.Slider, -100, 100, 0, 1, Unit: "%"));
-                list.Add(new(k + "_k", $"Preto ({n})", ParamType.Slider, -100, 100, 0, 1, Unit: "%"));
-            }
-            return list.ToArray();
-        }
-        public static readonly string[] ScaleTargets = { "Só o programa da regra deste preset", "Qualquer janela em primeiro plano" };
         public static readonly string[] PatternTypes = { "Pontos", "Linhas", "Xadrez", "Scanlines", "Trama cruzada", "Diagonais" };
 
         public static readonly LayerDef[] All =
@@ -284,27 +260,6 @@ namespace ScreenMaster.Core
                     new ParamDef("color3", "Altas luzes", ParamType.Color, DefaultText: "#FFD9A0"),
                     new ParamDef("reverse", "Inverter", ParamType.Toggle, 0, 1, 0),
                 } },
-            new() { Kind = LayerKind.ColorLookup, Name = "Pesquisa de cores", Group = "Shader", Engine = EngineKind.Shader,
-                Hint = ShaderHint + " Escolha um look pronto ou um arquivo .cube seu (LUT 3D); a opacidade mistura com a imagem original.",
-                Params = Array.Empty<ParamDef>() },
-            new() { Kind = LayerKind.SelectiveColor, Name = "Cor seletiva", Group = "Shader", Engine = EngineKind.Shader,
-                Hint = ShaderHint, Params = SelectiveParams() },
-            new() { Kind = LayerKind.Sharpen, Name = "Nitidez e remover névoa", Group = "Shader", Engine = EngineKind.Shader,
-                Hint = ShaderHint,
-                Params = new[] {
-                    new ParamDef("sharpen", "Nitidez", ParamType.Slider, 0, 100, 40, 1, Unit: "%"),
-                    new ParamDef("clarity", "Clareza", ParamType.Slider, -100, 100, 0, 1),
-                    new ParamDef("dehaze", "Remover névoa", ParamType.Slider, -100, 100, 0, 1),
-                } },
-            new() { Kind = LayerKind.Scale, Name = "Modo escala", Group = "Shader", Engine = EngineKind.Shader, Unique = true,
-                Hint = "Experimental: amplia a janela de um jogo (em janela, resolução menor) para a tela inteira. Coloque num preset ligado a um programa em “Ativar com programas”. O mouse fica preso na janela; Alt+Tab solta. Ctrl+Alt+Shift+E pausa/retoma.",
-                Params = new[] {
-                    new ParamDef("target", "Janela", ParamType.Choice, 0, 1, 0, Choices: ScaleTargets),
-                    new ParamDef("filter", "Ampliação", ParamType.Choice, 0, 20, 3, Choices: Engines.ScaleMath.Filters),
-                    new ParamDef("sharpen", "Nitidez depois de ampliar", ParamType.Slider, 0, 100, 40, 1, Unit: "%"),
-                    new ParamDef("aspect", "Proporção", ParamType.Choice, 0, 4, 0, Choices: Engines.ScaleMath.Aspects),
-                    new ParamDef("integer", "Escala inteira (2×, 3×…; só com “Manter a da janela”)", ParamType.Toggle, 0, 1, 0),
-                } },
             new() { Kind = LayerKind.WindowsTheme, Name = "Tema do Windows", Group = "Sistema", Engine = EngineKind.System, Unique = true,
                 Hint = "Troca o tema claro/escuro do Windows. Combine com a agenda: claro de dia, escuro à noite. Ao sair do preset, volta ao tema que estava.",
                 Params = new[] {
@@ -377,7 +332,6 @@ namespace ScreenMaster.Core
             if (kind == LayerKind.Gradient) l.Opacity = 15;
             if (kind == LayerKind.Guides) l.Opacity = 35;
             if (kind == LayerKind.Pattern) l.Opacity = 15;
-            if (kind == LayerKind.ColorLookup) l.S["file"] = "";
             return l;
         }
 
