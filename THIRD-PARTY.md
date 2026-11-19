@@ -9,6 +9,7 @@
 | [NVIDIA Image Scaling](https://github.com/NVIDIAGameWorks/NVIDIAImageScaling) (`NIS_Scaler.h`, `NIS_Config.h`, sem alterações; constantes portadas para C#) | modo escala: NIS | MIT, ver `ScreenMaster/Vendor/nis/LICENSE.txt` |
 | [Super xBR](https://github.com/libretro/slang-shaders) (Hyllian), traduzido de GLSL para HLSL | modo escala: Super xBR | MIT, ver `ScreenMaster/Vendor/xbr/LICENSE.txt` |
 | [Anime4K](https://github.com/bloc97/Anime4K) (bloc97), Upscale CNN x2 S e M traduzidos de GLSL para HLSL | modo escala: Anime4K | MIT, ver `ScreenMaster/Vendor/anime4k/LICENSE.txt` |
+| LUTs de exemplo em `luts/` (de [cartcut](https://github.com/cartesiancs/cartcut)) | Pesquisa de cores | MIT, ver `luts/LICENSE.txt` |
 | [Snapdragon Game Super Resolution 1](https://github.com/SnapdragonStudios/snapdragon-gsr) (`sgsr1_mobile.h`, sem alterações) | modo escala: SGSR | BSD-3-Clause, ver `ScreenMaster/Vendor/sgsr/LICENSE.txt` |
 
 Algoritmos reimplementados a partir de descrições publicadas (sem copiar código): nitidez adaptativa no estilo do AMD FidelityFX CAS (MIT), simulação de daltonismo de Machado, Oliveira & Fernandes (2009), temperatura de cor pelo ajuste de Tanner Helland.
