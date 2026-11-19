@@ -136,6 +136,7 @@ namespace ScreenMaster.Engines
             }
             sb.AppendLine("kinds: checked " + Enum.GetValues<LayerKind>().Length);
             sb.AppendLine(ScaleMath.Check());
+            { var lib = LutLibrary(); sb.AppendLine(lib.Count >= 15 ? $"lut library: ok ({lib.Count})" : $"lut library: FAIL ({lib.Count})"); }
             try { sb.AppendLine(OffscreenTest()); }
             catch (Exception ex) { sb.AppendLine("passes: FAIL " + ex.Message); }
             return sb.ToString();
@@ -337,6 +338,30 @@ namespace ScreenMaster.Engines
         }
 
         // ------------------------------------------------------------------ LUT files
+
+        /// <summary>Folder with the built-in LUTs (%APPDATA%\ScreenMaster\luts), filled from the exe on first use.</summary>
+        public static string LutFolder => Path.Combine(Paths.Dir, "luts");
+
+        /// <summary>Built-in LUTs (title, path), extracted from the exe if missing; sorted by title.</summary>
+        public static List<(string title, string path)> LutLibrary()
+        {
+            var list = new List<(string, string)>();
+            try
+            {
+                Directory.CreateDirectory(LutFolder);
+                var asm = typeof(ShaderEngine).Assembly;
+                foreach (var name in asm.GetManifestResourceNames().Where(n => n.StartsWith("luts/", StringComparison.Ordinal) && n.EndsWith(".cube", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var dest = Path.Combine(LutFolder, name.Substring(5));
+                    using var s = asm.GetManifestResourceStream(name)!;
+                    if (!File.Exists(dest) || new FileInfo(dest).Length != s.Length)
+                        using (var f = File.Create(dest)) s.CopyTo(f);
+                    try { list.Add((LoadCube(dest).Title, dest)); } catch (Exception ex) { Log.Write($"lut {dest}: {ex.Message}"); }
+                }
+            }
+            catch (Exception ex) { Log.Write("lut library: " + ex.Message); }
+            return list.OrderBy(x => x.Item1, StringComparer.CurrentCultureIgnoreCase).ToList();
+        }
 
         public sealed record CubeLut(int Size, float[] Rgba, string Title);
         static readonly Dictionary<string, (DateTime stamp, CubeLut lut)> _cubeCache = new(StringComparer.OrdinalIgnoreCase);

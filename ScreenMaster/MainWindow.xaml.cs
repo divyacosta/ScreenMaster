@@ -1076,31 +1076,40 @@ namespace ScreenMaster
 
         FrameworkElement LutFileRow(Layer l)
         {
+            // the built-in looks + the current file (if it is another one) + "Outro arquivo…"
+            var items = Engines.ShaderEngine.LutLibrary().Select(x => new Choice(x.path, x.title)).ToList();
             var path = l.GetS("file");
             if (path == "#FFFFFF") path = "";
-            string Describe(string p)
+            if (path.Length > 0 && !items.Any(c => c.Key.Equals(path, StringComparison.OrdinalIgnoreCase)))
             {
-                if (p.Length == 0) return "Nenhum arquivo";
-                try { var lut = Engines.ShaderEngine.LoadCube(p); return $"{lut.Title} · {lut.Size}³"; }
-                catch (Exception ex) { return "Erro: " + ex.Message; }
+                string title;
+                try { title = Engines.ShaderEngine.LoadCube(path).Title; } catch { title = System.IO.Path.GetFileNameWithoutExtension(path) + " (não encontrado)"; }
+                items.Insert(0, new Choice(path, title));
             }
-            var label = new TextBlock { Text = Describe(path), Foreground = Ui.Res("Dim"), TextTrimming = TextTrimming.CharacterEllipsis, VerticalAlignment = VerticalAlignment.Center, ToolTip = path };
-            var btn = new Button { Content = "Carregar .cube…", Style = (Style)FindResource("Quiet"), Padding = new Thickness(10, 3, 10, 3), Margin = new Thickness(8, 0, 0, 0) };
-            btn.Click += (_, _) =>
+            const string Other = "\u0001other";
+            items.Add(new Choice(Other, "Outro arquivo .cube…"));
+            var combo = new ComboBox { ItemsSource = items, DisplayMemberPath = "Label", MaxDropDownHeight = 420 };
+            combo.SelectedItem = items.FirstOrDefault(c => c.Key.Equals(path, StringComparison.OrdinalIgnoreCase));
+            var last = combo.SelectedItem;
+            combo.SelectionChanged += (_, _) =>
             {
-                var dlg = new Microsoft.Win32.OpenFileDialog { Filter = "LUT 3D (*.cube)|*.cube", Title = "Escolha uma LUT 3D" };
-                if (dlg.ShowDialog(this) != true) return;
-                try { Engines.ShaderEngine.LoadCube(dlg.FileName); }
-                catch (Exception ex) { MessageBox.Show(this, "Não foi possível ler a LUT: " + ex.Message, "ScreenMaster"); return; }
-                l.S["file"] = dlg.FileName;
-                label.Text = Describe(dlg.FileName); label.ToolTip = dlg.FileName;
+                if (combo.SelectedItem is not Choice c || c == last) return;
+                var file = c.Key;
+                if (file == Other)
+                {
+                    var dlg = new Microsoft.Win32.OpenFileDialog { Filter = "LUT 3D (*.cube)|*.cube", Title = "Escolha uma LUT 3D" };
+                    if (dlg.ShowDialog(this) != true) { combo.SelectedItem = last; return; }
+                    try { Engines.ShaderEngine.LoadCube(dlg.FileName); }
+                    catch (Exception ex) { MessageBox.Show(this, "Não foi possível ler a LUT: " + ex.Message, "ScreenMaster"); combo.SelectedItem = last; return; }
+                    file = dlg.FileName;
+                }
+                l.S["file"] = file;
                 LayerEdited(l);
+                if (c.Key == Other) Dispatcher.BeginInvoke(() => ShowProps(l)); // the new file shows up in the list
+                else last = c;
             };
-            var dp = new DockPanel { Margin = new Thickness(0, 0, 0, 12) };
-            DockPanel.SetDock(btn, Dock.Right);
-            dp.Children.Add(btn);
-            dp.Children.Add(label);
-            return Ui.Row("Arquivo", dp);
+            Help.Set(combo, new HelpInfo("Look (LUT 3D)", "Escolha um dos looks prontos ou carregue um arquivo .cube seu (DaVinci, Photoshop, Premiere…). A opacidade mistura com a imagem original.", null));
+            return Ui.Row("Look", combo);
         }
 
         void ShowProps(Layer? l, AgendaTrack? track = null, bool linked = false)

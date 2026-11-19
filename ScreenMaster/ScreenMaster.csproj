@@ -24,6 +24,7 @@
   <ItemGroup>
     <Resource Include="Assets\MaterialSymbolsRounded.ttf" />
     <EmbeddedResource Include="Vendor\**\*.h;Vendor\**\*.hlsl" LogicalName="Vendor/%(RecursiveDir)%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\luts\*.cube" LogicalName="luts/%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>

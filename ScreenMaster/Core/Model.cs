@@ -285,7 +285,7 @@ namespace ScreenMaster.Core
                     new ParamDef("reverse", "Inverter", ParamType.Toggle, 0, 1, 0),
                 } },
             new() { Kind = LayerKind.ColorLookup, Name = "Pesquisa de cores", Group = "Shader", Engine = EngineKind.Shader,
-                Hint = ShaderHint + " Carregue um arquivo .cube (LUT 3D); a opacidade mistura com a imagem original.",
+                Hint = ShaderHint + " Escolha um look pronto ou um arquivo .cube seu (LUT 3D); a opacidade mistura com a imagem original.",
                 Params = Array.Empty<ParamDef>() },
             new() { Kind = LayerKind.SelectiveColor, Name = "Cor seletiva", Group = "Shader", Engine = EngineKind.Shader,
                 Hint = ShaderHint, Params = SelectiveParams() },

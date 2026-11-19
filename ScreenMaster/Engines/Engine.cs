@@ -218,7 +218,7 @@ namespace ScreenMaster.Engines
             {
                 var err = Monitors.Where(m => l.AppliesTo(m.DeviceName)).Select(m => shaderErrors.GetValueOrDefault(m.DeviceName)).FirstOrDefault(e => !string.IsNullOrEmpty(e));
                 if (err != null) LayerErrors[l.Id] = err;
-                else if (l.Kind == LayerKind.ColorLookup && string.IsNullOrWhiteSpace(l.GetS("file"))) LayerErrors[l.Id] = "Carregue um arquivo .cube.";
+                else if (l.Kind == LayerKind.ColorLookup && string.IsNullOrWhiteSpace(l.GetS("file"))) LayerErrors[l.Id] = "Escolha um look na lista “Look”.";
             }
 
             // ---- overlay (hidden from capture while the shader reads the screen, or it would be drawn twice)
